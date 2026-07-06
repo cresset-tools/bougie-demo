@@ -1,0 +1,22 @@
+#!/bin/sh
+# Magento's integration test framework shells out to the mariadb/mysql
+# CLI tools with --host/--port taken from install-config. An explicit
+# --port makes MariaDB clients insist on TCP, but bougie's MariaDB is
+# socket-only — so strip the endpoint arguments and substitute the
+# tenant socket that `bougie run` injects into the environment. The
+# real (tenant-wired) clients live in vendor/bougie/bin.
+#
+# Invoked via the mariadb / mariadb-dump / mysql / mysqldump symlinks
+# next to this script; the test runner prepends this directory to PATH.
+tool=$(basename "$0")
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/../../../.." && pwd)
+
+for arg in "$@"; do
+  shift
+  case "$arg" in
+    --host=* | --port=*) ;;
+    *) set -- "$@" "$arg" ;;
+  esac
+done
+
+exec "$root/vendor/bougie/bin/$tool" "$@" --socket="$BOUGIE_SERVICE_MARIADB_SOCKET"

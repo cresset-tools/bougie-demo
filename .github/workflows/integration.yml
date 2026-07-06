@@ -1,0 +1,58 @@
+name: Integration tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cresset-tools/setup-bougie@main
+        with:
+          telemetry: true
+
+      - name: Install PHP and dependencies
+        run: bougie sync
+
+      - name: Start services
+        run: bougie service up
+
+      # The Directory suite is a real slice of the Mage-OS integration
+      # testsuite (246 tests: admin controllers, ACL, currency import);
+      # the framework bootstrap installs a fresh test app into the
+      # project's tenant database first. PHPRC lifts the
+      # memory limit for the child PHP processes the framework spawns
+      # (setup:install), which `-d` on the phpunit process can't
+      # reach, and wires mysqlnd to the MariaDB socket; bin/ holds
+      # wrappers that point the framework's mariadb CLI calls at the
+      # same socket.
+      - name: Run Mage-OS integration tests
+        working-directory: dev/tests/integration
+        env:
+          PHPRC: ${{ github.workspace }}/dev/tests/integration/etc/php.ini
+        run: >-
+          bougie run -- sh -c
+          'PATH="$PWD/bin:$PATH" exec php ../../../vendor/bin/phpunit
+          -c phpunit.xml.dist testsuite/Magento/Directory'
+
+      - name: Stop services
+        if: always()
+        run: bougie stop || true
+
+      - name: Upload bougie logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bougie-logs
+          path: |
+            ~/.local/share/bougie/state/bougied.log
+            ~/.local/share/bougie/state/services/**/log/*
+          if-no-files-found: ignore

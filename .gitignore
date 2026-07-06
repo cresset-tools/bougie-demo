@@ -1,0 +1,26 @@
+# The whole Magento tree is materialized by `bougie sync` (vendor/ +
+# the magento2-base skeleton deploy), so the repo whitelists only the
+# project definition, the CI workflow, and the integration-test config.
+/*
+!/.github
+!/.gitignore
+!/README.md
+!/composer.json
+!/composer.lock
+!/dev
+/dev/*
+!/dev/tests
+/dev/tests/*
+!/dev/tests/integration
+/dev/tests/integration/*
+!/dev/tests/integration/bin
+/dev/tests/integration/bin/*
+!/dev/tests/integration/bin/db-client
+!/dev/tests/integration/bin/mariadb
+!/dev/tests/integration/bin/mariadb-dump
+!/dev/tests/integration/bin/mysql
+!/dev/tests/integration/bin/mysqldump
+!/dev/tests/integration/etc
+/dev/tests/integration/etc/*
+!/dev/tests/integration/etc/install-config-mysql.php
+!/dev/tests/integration/etc/php.ini
