@@ -18,4 +18,3 @@
 !/dev/tests/integration/etc
 /dev/tests/integration/etc/*
 !/dev/tests/integration/etc/install-config-mysql.php
-!/dev/tests/integration/etc/php.ini
