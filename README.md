@@ -58,8 +58,10 @@ Mage-OS:
   `--host/--port` (which MariaDB clients treat as TCP-only).
 - [patches/framework-pdo-mysql-socket-reconnect.diff](patches/framework-pdo-mysql-socket-reconnect.diff)
   fixes the PDO adapter's half of the same story: the first `_connect`
-  consumes `host` into `unix_socket`, so any reconnect on the same
-  adapter died with "No host configured to connect".
+  consumed `host` into `unix_socket` and unset it, so any reconnect on
+  the same adapter died with "No host configured to connect". The
+  one-line fix keeps `host = 'localhost'` alongside `unix_socket` —
+  mysqlnd routes that combination through the socket.
 
 The patch files use a `.diff` suffix deliberately: bougie also
 auto-applies any `patches/*.patch` file (zero-config), and these are
