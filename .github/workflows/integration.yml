@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: cresset-tools/setup-bougie@main
+      - uses: cresset-tools/setup-bougie@v1
         with:
           telemetry: true
 
