@@ -38,21 +38,34 @@ on any machine:
 ```console
 $ bougie service up
 $ cd dev/tests/integration
-$ PHPRC=$PWD/etc/php.ini bougie run -- sh -c \
-    'PATH="$PWD/bin:$PATH" exec php ../../../vendor/bin/phpunit \
-     -c phpunit.xml.dist testsuite/Magento/Directory'
+$ PHPRC=$PWD/etc/php.ini bougie run -- php ../../../vendor/bin/phpunit \
+    -c phpunit.xml.dist testsuite/Magento/Directory
 ```
 
 Two small adapters make the stock framework talk to bougie's
 socket-only MariaDB:
 
+- [patches/testframework-db-mysql-unix-socket.patch](patches/testframework-db-mysql-unix-socket.patch)
+  teaches the framework's `Db\Mysql` the same convention Magento's PDO
+  adapter already has: a `db-host` containing `/` is a Unix socket, so
+  its `mariadb` / `mariadb-dump` shell-outs get `--socket=` instead of
+  `--host/--port` (which MariaDB clients treat as TCP-only). Applied
+  automatically by bougie's native composer-patches support — any
+  `patches/*.patch` is picked up on `bougie sync`. Candidate for
+  upstreaming to Mage-OS.
 - `PHPRC` points at [etc/php.ini](dev/tests/integration/etc/php.ini):
   `memory_limit = -1` for the child PHP processes the framework spawns
-  (its own `setup:install`), and `pdo_mysql.default_socket` expanded
-  from the `BOUGIE_SERVICE_MARIADB_SOCKET` env `bougie run` injects.
-- [bin/](dev/tests/integration/bin/db-client) wrappers rewrite the
-  framework's `mariadb` / `mariadb-dump` CLI calls from `--host/--port`
-  (which force TCP) to `--socket=`.
+  (its own `setup:install`), which `-d` flags can't reach.
+
+One temporary wart: bougie 0.44.0 deploys the magento2-base skeleton
+before applying patches, so after a fresh `bougie sync` copy the
+patched file over the deployed one (CI does the same; the ordering fix
+is upstream in bougie):
+
+```console
+$ cp vendor/mage-os/magento2-base/dev/tests/integration/framework/Magento/TestFramework/Db/Mysql.php \
+     dev/tests/integration/framework/Magento/TestFramework/Db/Mysql.php
+```
 
 Tests for your own modules under `app/code/*/*/Test/Integration` are
 picked up by the same suite automatically.

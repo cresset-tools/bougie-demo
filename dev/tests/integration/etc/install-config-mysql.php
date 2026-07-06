@@ -8,13 +8,14 @@
  */
 
 $config = [
-    // bougie's MariaDB is Unix-socket only. "localhost" selects the
-    // socket transport in both consumers of this value: mysqlnd takes
-    // the path from pdo_mysql.default_socket (etc/php.ini, expanded
-    // from this same env), and the framework's mariadb/mariadb-dump
-    // invocations take it from MYSQL_UNIX_PORT (set by the test
-    // runner). A raw socket path here would break the CLI tools,
-    // which receive it as --host=.
+    // bougie's MariaDB is Unix-socket only. "localhost" routes both
+    // consumers of this value through pdo_mysql.default_socket (set in
+    // etc/php.ini from the env `bougie run` injects): mysqlnd natively,
+    // and the framework's mariadb/mariadb-dump shell-outs via the
+    // committed patch in patches/ (upstream Db\Mysql only speaks
+    // --host/--port, which MariaDB clients treat as TCP-only). A raw
+    // socket path here would trip the PDO adapter's config mutation on
+    // reconnect ("No host configured to connect").
     'db-host' => 'localhost',
     'db-user' => getenv('BOUGIE_SERVICE_MARIADB_USER'),
     'db-password' => getenv('BOUGIE_SERVICE_MARIADB_PASSWORD'),

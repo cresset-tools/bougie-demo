@@ -1,0 +1,164 @@
+--- a/vendor/mage-os/magento2-base/dev/tests/integration/framework/Magento/TestFramework/Db/Mysql.php
++++ b/vendor/mage-os/magento2-base/dev/tests/integration/framework/Magento/TestFramework/Db/Mysql.php
+@@ -70,6 +70,13 @@
+     private $_port;
+ 
+     /**
++     * Unix socket path for connection, when the configured host is a path
++     *
++     * @var string
++     */
++    private $_socket = '';
++
++    /**
+      * @var bool
+      */
+     private $isMysqldumpVersion8;
+@@ -98,11 +105,26 @@
+     {
+         parent::__construct($host, $user, $password, $schema, $varPath, $shell);
+         $this->_port = self::DEFAULT_PORT;
+-        if (strpos($this->_host, ':') !== false) {
++        if (strpos($this->_host, '/') !== false) {
++            // A path means a Unix socket, mirroring the db-host convention
++            // of \Magento\Framework\DB\Adapter\Pdo\Mysql.
++            $this->_socket = $this->_host;
++            $this->_host = 'localhost';
++        } elseif (strpos($this->_host, ':') !== false) {
+             list($host, $port) = explode(':', $this->_host);
+             $this->_host = $host;
+             $this->_port = (int) $port;
+         }
++        if ($this->_socket === '' && $this->_host === 'localhost') {
++            // "localhost" means the Unix socket to mysql/mariadb CLI
++            // clients; align them with the socket PHP itself uses (the
++            // PDO layer reads the same ini) when one exists. An explicit
++            // --port would otherwise force the clients onto TCP.
++            $socket = ini_get('pdo_mysql.default_socket');
++            if ($socket && file_exists($socket)) {
++                $this->_socket = $socket;
++            }
++        }
+         $this->_dbDumpFile = $this->_varPath . '/setup_dump_' . $this->_schema . '.sql';
+         $this->_defaultsExtraFile = rtrim($this->_varPath, '\\/') . '/' . self::DEFAULTS_EXTRA_FILE_NAME;
+     }
+@@ -116,14 +138,15 @@
+ 
+         $this->ensureDefaultsExtraFile();
+         $this->_shell->execute(
+-            "{$dbCommand} --defaults-file=%s --host=%s --port=%s %s -e %s",
+-            [
+-                $this->_defaultsExtraFile,
+-                $this->_host,
+-                $this->_port,
+-                $this->_schema,
+-                "DROP DATABASE `{$this->_schema}`; CREATE DATABASE `{$this->_schema}`"
+-            ]
++            "{$dbCommand} --defaults-file=%s {$this->getEndpointFormat()} %s -e %s",
++            array_merge(
++                [$this->_defaultsExtraFile],
++                $this->getEndpointArguments(),
++                [
++                    $this->_schema,
++                    "DROP DATABASE `{$this->_schema}`; CREATE DATABASE `{$this->_schema}`"
++                ]
++            )
+         );
+     }
+ 
+@@ -166,7 +189,7 @@
+ 
+         $format = sprintf(
+             '%s %s %s %s',
+-            "{$dumpCommand} --defaults-file=%s --host=%s --port=%s",
++            "{$dumpCommand} --defaults-file=%s {$this->getEndpointFormat()}",
+             '--no-tablespaces',
+             implode(' ', $additionalArguments),
+             '%s > %s'
+@@ -174,13 +197,14 @@
+ 
+         $this->_shell->execute(
+             $format,
+-            [
+-                $this->_defaultsExtraFile,
+-                $this->_host,
+-                $this->_port,
+-                $this->_schema,
+-                $this->getSetupDbDumpFilename()
+-            ]
++            array_merge(
++                [$this->_defaultsExtraFile],
++                $this->getEndpointArguments(),
++                [
++                    $this->_schema,
++                    $this->getSetupDbDumpFilename()
++                ]
++            )
+         );
+     }
+ 
+@@ -199,9 +223,12 @@
+         $dbCommand = $this->getDbCommand();
+ 
+         $this->_shell->execute(
+-            "{$dbCommand} --defaults-file=%s --host=%s --port=%s %s < %s",
+-            [$this->_defaultsExtraFile, $this->_host, $this->_port,
+-                $this->_schema, $this->getSetupDbDumpFilename()]
++            "{$dbCommand} --defaults-file=%s {$this->getEndpointFormat()} %s < %s",
++            array_merge(
++                [$this->_defaultsExtraFile],
++                $this->getEndpointArguments(),
++                [$this->_schema, $this->getSetupDbDumpFilename()]
++            )
+         );
+     }
+ 
+@@ -214,6 +241,27 @@
+     }
+ 
+     /**
++     * Endpoint fragment for the mysql/mariadb CLI tools: --socket for a
++     * Unix socket path, --host/--port otherwise
++     *
++     * @return string
++     */
++    private function getEndpointFormat()
++    {
++        return $this->_socket !== '' ? '--socket=%s' : '--host=%s --port=%s';
++    }
++
++    /**
++     * Endpoint arguments matching getEndpointFormat()
++     *
++     * @return array
++     */
++    private function getEndpointArguments()
++    {
++        return $this->_socket !== '' ? [$this->_socket] : [$this->_host, $this->_port];
++    }
++
++    /**
+      * Create defaults extra file
+      *
+      * @return void
+@@ -261,13 +309,13 @@
+         if (!isset($this->isUsingAuroraDb)) {
+             try {
+                 $this->_shell->execute(
+-                    'mysql --defaults-file=%s --host=%s --port=%s %s --execute="SELECT AURORA_VERSION()"',
+-                    [
+-                        $this->_defaultsExtraFile,
+-                        $this->_host,
+-                        $this->_port,
+-                        $this->_schema
+-                    ]
++                    'mysql --defaults-file=%s ' . $this->getEndpointFormat()
++                        . ' %s --execute="SELECT AURORA_VERSION()"',
++                    array_merge(
++                        [$this->_defaultsExtraFile],
++                        $this->getEndpointArguments(),
++                        [$this->_schema]
++                    )
+                 );
+ 
+                 $this->isUsingAuroraDb = true;
