@@ -2,6 +2,7 @@
   "_version": 1,
   "_generator": "bougie",
   "fingerprints": {
-    "mage-os/magento2-base": "3b4a0e986b4bb84311ca7c9a89890c1da4ed882957e968642545f8ff6423f143"
+    "mage-os/framework": "57924a03306c33aa43be89e6a0d55cd42c0f2ccbe9d79833a8ba425ab13e1016",
+    "mage-os/magento2-base": "0ffd623113c671c806611978f877ce5aac30e720147748f3dcc27ac3b40b68cf"
   }
 }

@@ -8,15 +8,13 @@
  */
 
 $config = [
-    // bougie's MariaDB is Unix-socket only. "localhost" routes both
-    // consumers of this value through pdo_mysql.default_socket (set in
-    // etc/php.ini from the env `bougie run` injects): mysqlnd natively,
-    // and the framework's mariadb/mariadb-dump shell-outs via the
-    // committed patch in patches/ (upstream Db\Mysql only speaks
-    // --host/--port, which MariaDB clients treat as TCP-only). A raw
-    // socket path here would trip the PDO adapter's config mutation on
-    // reconnect ("No host configured to connect").
-    'db-host' => 'localhost',
+    // bougie's MariaDB is Unix-socket only; the socket path goes in as
+    // db-host. Magento's PDO adapter understands a path here natively,
+    // and the two patches declared in composer.json extra.patches close
+    // the gaps: the test framework's mariadb/mariadb-dump shell-outs
+    // only speak --host/--port (TCP), and the PDO adapter consumes the
+    // host config on first connect, breaking reconnects.
+    'db-host' => getenv('BOUGIE_SERVICE_MARIADB_SOCKET'),
     'db-user' => getenv('BOUGIE_SERVICE_MARIADB_USER'),
     'db-password' => getenv('BOUGIE_SERVICE_MARIADB_PASSWORD'),
     // The project's tenant database. The test framework installs the

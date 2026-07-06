@@ -30,6 +30,14 @@
         "opensearch": "*",
         "rabbitmq": "*"
       }
+    },
+    "patches": {
+      "mage-os/framework": {
+        "Keep unix-socket db-host reconnectable (first _connect consumes host into unix_socket)": "patches/framework-pdo-mysql-socket-reconnect.diff"
+      },
+      "mage-os/magento2-base": {
+        "Integration test framework: mariadb CLI tools accept a Unix-socket db-host": "patches/testframework-db-mysql-unix-socket.diff"
+      }
     }
   },
   "autoload": {

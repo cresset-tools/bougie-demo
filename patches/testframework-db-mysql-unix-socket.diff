@@ -1,5 +1,5 @@
---- a/vendor/mage-os/magento2-base/dev/tests/integration/framework/Magento/TestFramework/Db/Mysql.php
-+++ b/vendor/mage-os/magento2-base/dev/tests/integration/framework/Magento/TestFramework/Db/Mysql.php
+--- a/dev/tests/integration/framework/Magento/TestFramework/Db/Mysql.php
++++ b/dev/tests/integration/framework/Magento/TestFramework/Db/Mysql.php
 @@ -70,6 +70,13 @@
      private $_port;
  
@@ -14,7 +14,7 @@
       * @var bool
       */
      private $isMysqldumpVersion8;
-@@ -98,11 +105,26 @@
+@@ -98,7 +105,12 @@
      {
          parent::__construct($host, $user, $password, $schema, $varPath, $shell);
          $this->_port = self::DEFAULT_PORT;
@@ -28,21 +28,7 @@
              list($host, $port) = explode(':', $this->_host);
              $this->_host = $host;
              $this->_port = (int) $port;
-         }
-+        if ($this->_socket === '' && $this->_host === 'localhost') {
-+            // "localhost" means the Unix socket to mysql/mariadb CLI
-+            // clients; align them with the socket PHP itself uses (the
-+            // PDO layer reads the same ini) when one exists. An explicit
-+            // --port would otherwise force the clients onto TCP.
-+            $socket = ini_get('pdo_mysql.default_socket');
-+            if ($socket && file_exists($socket)) {
-+                $this->_socket = $socket;
-+            }
-+        }
-         $this->_dbDumpFile = $this->_varPath . '/setup_dump_' . $this->_schema . '.sql';
-         $this->_defaultsExtraFile = rtrim($this->_varPath, '\\/') . '/' . self::DEFAULTS_EXTRA_FILE_NAME;
-     }
-@@ -116,14 +138,15 @@
+@@ -116,14 +128,15 @@
  
          $this->ensureDefaultsExtraFile();
          $this->_shell->execute(
@@ -66,7 +52,7 @@
          );
      }
  
-@@ -166,7 +189,7 @@
+@@ -166,7 +179,7 @@
  
          $format = sprintf(
              '%s %s %s %s',
@@ -75,7 +61,7 @@
              '--no-tablespaces',
              implode(' ', $additionalArguments),
              '%s > %s'
-@@ -174,13 +197,14 @@
+@@ -174,13 +187,14 @@
  
          $this->_shell->execute(
              $format,
@@ -97,7 +83,7 @@
          );
      }
  
-@@ -199,9 +223,12 @@
+@@ -199,9 +213,12 @@
          $dbCommand = $this->getDbCommand();
  
          $this->_shell->execute(
@@ -113,7 +99,7 @@
          );
      }
  
-@@ -214,6 +241,27 @@
+@@ -214,6 +231,27 @@
      }
  
      /**
@@ -141,7 +127,7 @@
       * Create defaults extra file
       *
       * @return void
-@@ -261,13 +309,13 @@
+@@ -261,13 +299,13 @@
          if (!isset($this->isUsingAuroraDb)) {
              try {
                  $this->_shell->execute(
