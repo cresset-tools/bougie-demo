@@ -99,12 +99,13 @@
          );
      }
  
-@@ -214,6 +231,27 @@
+@@ -214,6 +231,28 @@
      }
  
      /**
-+     * Endpoint fragment for the mysql/mariadb CLI tools: --socket for a
-+     * Unix socket path, --host/--port otherwise
++     * Endpoint format fragment for the mysql/mariadb CLI tools
++     *
++     * Yields --socket=%s for a Unix socket path, --host=%s --port=%s otherwise.
 +     *
 +     * @return string
 +     */
@@ -127,7 +128,7 @@
       * Create defaults extra file
       *
       * @return void
-@@ -261,13 +299,13 @@
+@@ -261,13 +300,13 @@
          if (!isset($this->isUsingAuroraDb)) {
              try {
                  $this->_shell->execute(
