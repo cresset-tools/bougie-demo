@@ -1,0 +1,134 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Prime N parallel integration-test workers from the thread-0 sandbox.
+ *
+ * The framework installs the test app once into tmp/sandbox-0-<hash> and
+ * stores a DB dump next to it. This script clones that install N times —
+ * one database (`<tenant>_t<n>`, loaded from the dump) plus one sandbox
+ * dir (thread-numbered copy, env.php rewritten) per worker — so paratest
+ * workers see isInstalled() and boot straight into tests, never running
+ * setup:install themselves.
+ *
+ * Run from dev/tests/integration, under bougie so the tenant env vars and
+ * the MariaDB socket are wired:
+ *
+ *   bougie run -- php bin/parallel-prime 8
+ *
+ * Re-running is safe: databases are reloaded from the dump and sandboxes
+ * re-copied. Requires the thread-0 sandbox to exist — run any single test
+ * once (`bougie run -- php ../../../vendor/bin/phpunit -c phpunit.xml.dist
+ * --filter nothing testsuite/Magento/Directory`) if it doesn't.
+ */
+
+$workers = (int) ($argv[1] ?? 8);
+if ($workers < 1 || $workers > 64) {
+    fwrite(STDERR, "usage: parallel-prime <workers 1..64>\n");
+    exit(2);
+}
+
+$base   = getenv('BOUGIE_SERVICE_MARIADB_DATABASE');
+$socket = getenv('BOUGIE_SERVICE_MARIADB_SOCKET');
+$tenant = getenv('BOUGIE_SERVICE_MARIADB_USER');
+if (!$base || !$socket || !$tenant) {
+    fwrite(STDERR, "BOUGIE_SERVICE_MARIADB_* not set — run me under `bougie run`.\n");
+    exit(2);
+}
+
+$root     = dirname(__DIR__);
+$hash     = hash('sha256', sha1_file($root . '/etc/install-config-mysql.php'));
+$template = "$root/tmp/sandbox-0-$hash";
+$dump     = "$template/setup_dump_$base.sql";
+if (!is_file("$template/etc/env.php") || !is_file($dump)) {
+    fwrite(STDERR, "thread-0 sandbox or its DB dump missing at $template —\n");
+    fwrite(STDERR, "run one test through phpunit.xml.dist first to install it.\n");
+    exit(1);
+}
+
+// Raw client, no tenant shim: connecting over the socket as the OS user
+// authenticates via unix_socket with admin rights (needed for CREATE
+// DATABASE + GRANT; the tenant grant covers only its own database).
+$clients = glob(getenv('HOME') . '/.local/share/bougie/store/mariadb-*/bin/mariadb');
+if (!$clients) {
+    fwrite(STDERR, "no mariadb client under ~/.local/share/bougie/store\n");
+    exit(1);
+}
+$client = end($clients);
+
+function sql(string $client, string $socket, string $sql, ?string $db = null): void
+{
+    $cmd = escapeshellarg($client) . ' --socket=' . escapeshellarg($socket)
+        . ($db !== null ? ' ' . escapeshellarg($db) : '')
+        . ' -e ' . escapeshellarg($sql);
+    passthru($cmd, $rc);
+    if ($rc !== 0) {
+        fwrite(STDERR, "SQL failed (rc=$rc): $sql\n");
+        exit(1);
+    }
+}
+
+// Authoritative refresh of the shared test modules: workers in parallel
+// mode skip the framework's remove+recopy (racy mid-run), so stale
+// modules are cleared here and the first worker re-copies them under the
+// bootstrap lock before any test runs.
+foreach (new DirectoryIterator("$root/framework/../_files/Magento") as $module) {
+    if ($module->isDir() && !$module->isDot()) {
+        passthru('rm -rf ' . escapeshellarg("$root/../../../app/code/Magento/" . $module->getFilename()));
+    }
+}
+
+$start = microtime(true);
+for ($t = 1; $t <= $workers; $t++) {
+    $db   = "{$base}_t{$t}";
+    $dest = "$root/tmp/sandbox-{$t}-{$hash}";
+
+    sql($client, $socket,
+        "CREATE DATABASE IF NOT EXISTS `$db` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; " .
+        "GRANT ALL PRIVILEGES ON `$db`.* TO '$tenant'@'localhost';");
+
+    $load = escapeshellarg($client) . ' --socket=' . escapeshellarg($socket)
+        . ' ' . escapeshellarg($db) . ' < ' . escapeshellarg($dump);
+    passthru($load, $rc);
+    if ($rc !== 0) {
+        fwrite(STDERR, "loading dump into $db failed (rc=$rc)\n");
+        exit(1);
+    }
+
+    // Per-worker search index namespace; shared OpenSearch otherwise
+    // collides the moment two workers reindex. Every engine variant gets
+    // a row because tests fixture the *engine*, and whichever prefix path
+    // that engine resolves must not fall back to the shared default.
+    // (DB rows, not env.php `system` locks — a locked system section
+    // makes the framework's process-isolation children die with
+    // "Premature end of PHP process".)
+    $prefixSql = "DELETE FROM core_config_data WHERE path LIKE 'catalog/search/%index_prefix';";
+    foreach (['opensearch', 'elasticsearch7', 'elasticsearch6', 'elasticsearch5', 'elasticsearch'] as $engine) {
+        $prefixSql .= " INSERT INTO core_config_data (scope, scope_id, path, value)" .
+            " VALUES ('default', 0, 'catalog/search/{$engine}_index_prefix', 'it_t{$t}');";
+    }
+    sql($client, $socket, $prefixSql, $db);
+
+    passthru('rm -rf ' . escapeshellarg($dest));
+    passthru('cp -a ' . escapeshellarg($template) . ' ' . escapeshellarg($dest), $rc);
+    if ($rc !== 0) {
+        fwrite(STDERR, "copying sandbox to $dest failed\n");
+        exit(1);
+    }
+
+    // The copy's dump belongs to the worker's schema name (the framework
+    // resolves setup_dump_<dbname>.sql), and its caches may embed the
+    // template's absolute path — drop them, they rebuild.
+    rename("$dest/setup_dump_$base.sql", "$dest/setup_dump_$db.sql");
+    foreach (['var/cache', 'var/page_cache', 'var/session'] as $dir) {
+        passthru('rm -rf ' . escapeshellarg("$dest/$dir"));
+    }
+
+    $env = include "$dest/etc/env.php";
+    $env['db']['connection']['default']['dbname'] = $db;
+    file_put_contents("$dest/etc/env.php", "<?php\nreturn " . var_export($env, true) . ";\n");
+
+    echo "worker $t: $db + " . basename($dest) . "\n";
+}
+
+printf("primed %d workers in %.1fs\n", $workers, microtime(true) - $start);
+echo "run:  bougie run -- php ../../../vendor/bin/paratest -c phpunit-parallel.xml -p$workers testsuite/Magento/Directory\n";

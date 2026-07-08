@@ -1,0 +1,108 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Reset a worker slot's database and sandbox var/ to template state.
+ *
+ * Called by bin/parallel-modules between modules on a slot. Three steps,
+ * ~0.5s total where a dump reload costs ~15s (426 CREATE TABLEs are
+ * DDL-bound and don't parallelize):
+ *
+ *   1. Data-only SQL reset: DELETE every table + replay the template
+ *      dump's INSERTs + this worker's search-prefix rows, one
+ *      FK-checks-off transaction (.reset-t<slot>.sql, written by
+ *      parallel-modules).
+ *   2. Restore drifted AUTO_INCREMENT counters. Magento fixtures assume
+ *      install-fresh counters (hardcoded entity ids); a dump-diff shows
+ *      counter drift is the ONLY difference a data reset leaves behind,
+ *      and it alone breaks later modules. Only drifted tables get an
+ *      ALTER, so the DDL cost stays proportional to what the previous
+ *      module touched.
+ *   3. Wipe sandbox var/* — sessions/caches/preprocessed views built
+ *      against the previous module's state.
+ */
+
+$slot = (int) ($argv[1] ?? 0);
+$base   = getenv('BOUGIE_SERVICE_MARIADB_DATABASE');
+$socket = getenv('BOUGIE_SERVICE_MARIADB_SOCKET');
+if ($slot < 1 || !$base || !$socket) {
+    fwrite(STDERR, "usage: reset-worker <slot>, under `bougie run`\n");
+    exit(2);
+}
+
+$root    = dirname(__DIR__);
+$hash    = hash('sha256', sha1_file($root . '/etc/install-config-mysql.php'));
+$db      = "{$base}_t{$slot}";
+$logDir  = "$root/tmp/parallel-logs";
+$clients = glob(getenv('HOME') . '/.local/share/bougie/store/mariadb-*/bin/mariadb') ?: ['mariadb'];
+$client  = end($clients);
+
+$run = static function (string $args, ?string $stdinFile = null) use ($client, $socket): string {
+    $cmd = escapeshellarg($client) . ' --socket=' . escapeshellarg($socket) . ' ' . $args
+        . ($stdinFile !== null ? ' < ' . escapeshellarg($stdinFile) : '');
+    exec($cmd, $out, $rc);
+    if ($rc !== 0) {
+        fwrite(STDERR, "reset-worker: mariadb failed (rc=$rc): $args\n");
+        exit(1);
+    }
+    return implode("\n", $out);
+};
+
+// Reconcile schema against the template before the replay: DELETE data
+// from template tables, DROP tables tests created (per-store index
+// tables and the like) — both derived from THIS worker's live schema,
+// since a static list goes stale in both directions.
+$templateTables = array_flip(
+    json_decode((string) file_get_contents("$logDir/.template-tables.json"), true) ?: []
+);
+$live = $run('-N ' . escapeshellarg($db) . ' -e ' . escapeshellarg(
+    "SELECT table_name FROM information_schema.tables" .
+    " WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'"
+));
+$pre = "SET FOREIGN_KEY_CHECKS=0;\n";
+// Triggers first: tests that put mview in schedule mode leave changelog
+// triggers behind; the template has none, and a leftover trigger firing
+// into a dropped _cl table fails the DELETEs below.
+$triggers = $run('-N ' . escapeshellarg($db) . ' -e ' . escapeshellarg(
+    "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE()"
+));
+foreach (array_filter(array_map('trim', explode("\n", $triggers))) as $trigger) {
+    $pre .= "DROP TRIGGER IF EXISTS `$trigger`;\n";
+}
+foreach (array_filter(array_map('trim', explode("\n", $live))) as $liveTable) {
+    $pre .= isset($templateTables[$liveTable])
+        ? "DELETE FROM `$liveTable`;\n"
+        : "DROP TABLE `$liveTable`;\n";
+}
+$preFile = "$logDir/.reconcile-t$slot.sql";
+file_put_contents($preFile, $pre);
+$run(escapeshellarg($db), $preFile);
+
+$run(escapeshellarg($db), "$logDir/.reset-t$slot.sql");
+
+$template = json_decode((string) file_get_contents("$logDir/.autoinc.json"), true) ?: [];
+$current  = $run('-N ' . escapeshellarg($db) . ' -e ' . escapeshellarg(
+    'SELECT table_name, auto_increment FROM information_schema.tables' .
+    " WHERE table_schema = DATABASE() AND auto_increment IS NOT NULL"
+));
+$alters = '';
+foreach (array_filter(explode("\n", $current)) as $line) {
+    [$table, $counter] = explode("\t", $line);
+    $want = $template[$table] ?? 1;
+    if ((int) $counter !== (int) $want) {
+        $alters .= "ALTER TABLE `$table` AUTO_INCREMENT=$want; ";
+    }
+}
+if ($alters !== '') {
+    $run(escapeshellarg($db) . ' -e ' . escapeshellarg($alters));
+}
+
+exec('rm -rf ' . escapeshellarg("$root/tmp/sandbox-{$slot}-{$hash}/var") . '/*');
+
+// Drop this worker's OpenSearch indices: the DB reset restores template
+// indexer state, and a stale same-name index from the previous module
+// makes the next reindex fail with resource_already_exists.
+$osHost = getenv('BOUGIE_SERVICE_OPENSEARCH_HOST');
+$osPort = getenv('BOUGIE_SERVICE_OPENSEARCH_PORT');
+if ($osHost && $osPort) {
+    exec('curl -s -o /dev/null -X DELETE ' . escapeshellarg("http://$osHost:$osPort/it_t{$slot}_*"));
+}

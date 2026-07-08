@@ -8,6 +8,7 @@
   },
   "require-dev": {
     "allure-framework/allure-phpunit": "^3.2",
+    "brianium/paratest": "^7.14",
     "dealerdirect/phpcodesniffer-composer-installer": "^0.7 || ^1.0",
     "dg/bypass-finals": "^1.4",
     "friendsofphp/php-cs-fixer": "^3.22",
@@ -36,7 +37,8 @@
         "Keep unix-socket db-host reconnectable (first _connect consumes host into unix_socket)": "patches/framework-pdo-mysql-socket-reconnect.patch"
       },
       "mage-os/magento2-base": {
-        "Integration test framework: mariadb CLI tools accept a Unix-socket db-host": "patches/testframework-db-mysql-unix-socket.patch"
+        "Integration test framework: mariadb CLI tools accept a Unix-socket db-host": "patches/testframework-db-mysql-unix-socket.patch",
+        "Integration test framework: parallel workers skip the racy test-module redeploy": "patches/testframework-parallel-deploy-test-modules.patch"
       }
     }
   },

@@ -1,0 +1,80 @@
+--- a/vendor/mage-os/magento2-base/dev/tests/integration/framework/deployTestModules.php
++++ b/vendor/mage-os/magento2-base/dev/tests/integration/framework/deployTestModules.php
+@@ -15,37 +15,53 @@
+ $pathToCommittedTestModules = $testFrameworkDir . '/../_files/Magento';
+ $pathToInstalledMagentoInstanceModules = $testFrameworkDir . '/../../../../app/code/Magento';
+ 
+-// Remove stale test modules left by a previous run (e.g. restored from a warm CI cache)
+-$filesystem = new \Symfony\Component\Filesystem\Filesystem();
+-$staleIterator = new DirectoryIterator($pathToCommittedTestModules);
+-foreach ($staleIterator as $staleModule) {
+-    if ($staleModule->isDir() && !$staleModule->isDot()) {
+-        $filesystem->remove($pathToInstalledMagentoInstanceModules . '/' . $staleModule->getFilename());
++// In a parallel run (paratest workers), removing + re-copying the shared
++// app/code/Magento/TestModule* while sibling workers are already mid-test
++// yanks files out from under them. Workers therefore treat an existing
++// deployment as authoritative and only the first bootstrap (serialized by
++// the bootstrap lock) copies; `bin/parallel-prime` wipes the modules so
++// every primed session still starts from a fresh copy.
++$isParallelRun = (int)$settings->get('TESTS_PARALLEL_RUN') === 1;
++$testModulesDeployed = (bool)glob(
++    $pathToInstalledMagentoInstanceModules . '/TestModule*/registration.php',
++    GLOB_NOSORT
++);
++
++if (!$isParallelRun) {
++    // Remove stale test modules left by a previous run (e.g. restored from a warm CI cache)
++    $filesystem = new \Symfony\Component\Filesystem\Filesystem();
++    $staleIterator = new DirectoryIterator($pathToCommittedTestModules);
++    foreach ($staleIterator as $staleModule) {
++        if ($staleModule->isDir() && !$staleModule->isDot()) {
++            $filesystem->remove($pathToInstalledMagentoInstanceModules . '/' . $staleModule->getFilename());
++        }
+     }
++    unset($staleIterator, $staleModule, $filesystem);
+ }
+-unset($staleIterator, $staleModule, $filesystem);
+ 
+-$iterator = new RecursiveIteratorIterator(
+-    new RecursiveDirectoryIterator($pathToCommittedTestModules, RecursiveDirectoryIterator::FOLLOW_SYMLINKS)
+-);
+-/** @var SplFileInfo $file */
+-foreach ($iterator as $file) {
+-    if (!$file->isDir()) {
+-        $source = $file->getPathname();
+-        $relativePath = substr($source, strlen($pathToCommittedTestModules));
+-        $destination = $pathToInstalledMagentoInstanceModules . $relativePath;
+-        // phpcs:ignore Magento2.Functions.DiscouragedFunction
+-        $targetDir = dirname($destination);
+-        // phpcs:ignore Magento2.Functions.DiscouragedFunction
+-        if (!is_dir($targetDir)) {
++if (!$isParallelRun || !$testModulesDeployed) {
++    $iterator = new RecursiveIteratorIterator(
++        new RecursiveDirectoryIterator($pathToCommittedTestModules, RecursiveDirectoryIterator::FOLLOW_SYMLINKS)
++    );
++    /** @var SplFileInfo $file */
++    foreach ($iterator as $file) {
++        if (!$file->isDir()) {
++            $source = $file->getPathname();
++            $relativePath = substr($source, strlen($pathToCommittedTestModules));
++            $destination = $pathToInstalledMagentoInstanceModules . $relativePath;
++            // phpcs:ignore Magento2.Functions.DiscouragedFunction
++            $targetDir = dirname($destination);
++            // phpcs:ignore Magento2.Functions.DiscouragedFunction
++            if (!is_dir($targetDir)) {
++                // phpcs:ignore Magento2.Functions.DiscouragedFunction
++                mkdir($targetDir, 0755, true);
++            }
+             // phpcs:ignore Magento2.Functions.DiscouragedFunction
+-            mkdir($targetDir, 0755, true);
++            copy($source, $destination);
+         }
+-        // phpcs:ignore Magento2.Functions.DiscouragedFunction
+-        copy($source, $destination);
+     }
++    unset($iterator, $file);
+ }
+-unset($iterator, $file);
+ 
+ // Register the modules under '_files/'
+ $pathPattern = $pathToInstalledMagentoInstanceModules . '/TestModule*/registration.php';

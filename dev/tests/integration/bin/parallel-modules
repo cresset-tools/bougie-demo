@@ -1,0 +1,235 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Module-axis parallel runner for the integration suite.
+ *
+ * Each module's testsuite directory runs serially — its own phpunit
+ * process, its own worker sandbox + database (TEST_TOKEN, see
+ * bootstrap-parallel.php) — while up to N modules run at the same time.
+ * Intra-module test order matches a serial run exactly, so
+ * order-sensitive tests behave as upstream intended; a fresh process per
+ * module also resets the memory PHPUnit leaks across big suites.
+ *
+ * Longest-first scheduling: modules are queued by descending test-file
+ * count so Catalog/Framework/Sales start immediately and set the wall
+ * clock instead of dangling at the end.
+ *
+ * Run from dev/tests/integration, workers primed first:
+ *
+ *   bougie run -- php bin/parallel-prime 16
+ *   bougie run -- php bin/parallel-modules -p 16            # all modules
+ *   bougie run -- php bin/parallel-modules -p 8 Cms Tax     # a subset
+ *
+ * Logs land in tmp/parallel-logs/<Module>.log.
+ */
+
+$workers = 8;
+$timeout = 2700;
+$only    = [];
+for ($i = 1; $i < $argc; $i++) {
+    switch ($argv[$i]) {
+        case '-p': $workers = (int) $argv[++$i]; break;
+        case '-t': $timeout = (int) $argv[++$i]; break;
+        default:   $only[]  = $argv[$i];
+    }
+}
+if ($workers < 1 || $workers > 64) {
+    fwrite(STDERR, "workers must be 1..64\n");
+    exit(2);
+}
+if (!getenv('BOUGIE_SERVICE_MARIADB_DATABASE')) {
+    fwrite(STDERR, "BOUGIE_SERVICE_MARIADB_* not set — run me under `bougie run`.\n");
+    exit(2);
+}
+
+$root    = dirname(__DIR__);
+$phpunit = "$root/../../../vendor/bin/phpunit";
+$logDir  = "$root/tmp/parallel-logs";
+if (!is_dir($logDir)) {
+    mkdir($logDir, 0755, true);
+}
+
+// Discover modules, biggest first.
+$queue = [];
+foreach (new DirectoryIterator("$root/testsuite/Magento") as $entry) {
+    if (!$entry->isDir() || $entry->isDot()) {
+        continue;
+    }
+    $name = $entry->getFilename();
+    if ($only && !in_array($name, $only, true)) {
+        continue;
+    }
+    $count = 0;
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($entry->getPathname()));
+    foreach ($it as $f) {
+        if ($f->isFile() && str_ends_with($f->getFilename(), 'Test.php')) {
+            $count++;
+        }
+    }
+    if ($count > 0) {
+        $queue[$name] = $count;
+    }
+}
+arsort($queue);
+$queue = array_keys($queue);
+if (!$queue) {
+    fwrite(STDERR, "no modules matched\n");
+    exit(1);
+}
+printf("%d modules, %d workers, timeout %ds/module\n", count($queue), $workers, $timeout);
+
+// Between modules a slot's database is reset to template state with a
+// data-only script: DELETE every table + replay the template dump's
+// INSERTs + re-add this worker's search-prefix rows, one FK-checks-off
+// transaction. ~0.2s, vs ~15s to reload the dump — recreating 426
+// tables is DDL-bound and doesn't parallelize, so the trick is to never
+// drop the schema. Without this, a module that crashes mid-fixture
+// poisons every later module on its slot.
+$base   = getenv('BOUGIE_SERVICE_MARIADB_DATABASE');
+$socket = getenv('BOUGIE_SERVICE_MARIADB_SOCKET');
+$clients = glob(getenv('HOME') . '/.local/share/bougie/store/mariadb-*/bin/mariadb') ?: ['mariadb'];
+$client  = end($clients);
+$hash   = hash('sha256', sha1_file("$root/etc/install-config-mysql.php"));
+$dump   = "$root/tmp/sandbox-0-$hash/setup_dump_$base.sql";
+$inserts = [];
+$autoinc = [];
+$templateTables = [];
+$in = false;
+$table = null;
+foreach (file($dump) as $line) {
+    if (preg_match('/^CREATE TABLE `(.+)`/', $line, $m)) {
+        $table = $m[1];
+        $templateTables[] = $table;
+    } elseif ($table !== null && preg_match('/^\) ENGINE=.* AUTO_INCREMENT=(\d+)/', $line, $m)) {
+        $autoinc[$table] = (int) $m[1];
+    }
+    if (str_starts_with($line, 'INSERT INTO')) {
+        $in = true;
+    }
+    if ($in) {
+        $inserts[] = $line;
+        if (str_ends_with(rtrim($line), ';')) {
+            $in = false;
+        }
+    }
+}
+file_put_contents("$logDir/.autoinc.json", json_encode($autoinc));
+file_put_contents("$logDir/.template-tables.json", json_encode($templateTables));
+// The DELETE statements are generated per worker at reset time (see
+// reset-worker) — a static list goes stale as tests create per-store
+// index tables. This file holds only the schema-independent replay.
+// NO_AUTO_VALUE_ON_ZERO is essential: the template data has rows with
+// id 0 in AUTO_INCREMENT columns (admin store, NOT LOGGED IN customer
+// group); without it MariaDB replaces the 0 with the next counter
+// value and every zero-id system row silently shifts.
+for ($slot = 1; $slot <= $workers; $slot++) {
+    $prefixes = '';
+    foreach (['opensearch', 'elasticsearch7', 'elasticsearch6', 'elasticsearch5', 'elasticsearch'] as $engine) {
+        $prefixes .= "INSERT INTO core_config_data (scope, scope_id, path, value)"
+            . " VALUES ('default', 0, 'catalog/search/{$engine}_index_prefix', 'it_t{$slot}');\n";
+    }
+    file_put_contents(
+        "$logDir/.reset-t$slot.sql",
+        "SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO'; SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0; START TRANSACTION;\n"
+        . implode('', $inserts) . "\n" . $prefixes . "COMMIT;\n"
+    );
+}
+
+$baseEnv = getenv();
+$running = [];   // slot => [proc, module, started, log]
+$results = [];   // module => [seconds, exitCode, summary]
+$wallStart = microtime(true);
+
+$summaryOf = static function (string $logFile): string {
+    $tail = array_slice(file($logFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [], -25);
+    foreach (array_reverse($tail) as $line) {
+        $clean = preg_replace('/\x1b\[[0-9;]*m/', '', $line);
+        if (preg_match('/^(OK \(|OK, but|Tests: |No tests executed)/', $clean)) {
+            return $clean;
+        }
+    }
+    return '(no summary — see log)';
+};
+
+while ($queue || $running) {
+    for ($slot = 1; $slot <= $workers && $queue; $slot++) {
+        if (isset($running[$slot])) {
+            continue;
+        }
+        $module = array_shift($queue);
+        $log = "$logDir/$module.log";
+        // `exec` so the shell is replaced by phpunit and a timeout
+        // proc_terminate() reaches the real process, not a wrapper shell.
+        $cmd = 'exec ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($phpunit)
+            . ' -c phpunit-parallel.xml ' . escapeshellarg("testsuite/Magento/$module");
+        // Reset the slot to template state before every module — data,
+        // AUTO_INCREMENT counters, and sandbox var/ (see reset-worker).
+        // Unconditional so a run is immune to whatever state the previous
+        // run (or a crashed module) left on the slot; ~0.5s per module.
+        $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg("$root/bin/reset-worker")
+            . ' ' . $slot . ' && ' . $cmd;
+        $proc = proc_open(
+            $cmd,
+            [0 => ['file', '/dev/null', 'r'], 1 => ['file', $log, 'w'], 2 => ['redirect', 1]],
+            $pipes,
+            $root,
+            $baseEnv + ['TEST_TOKEN' => (string) $slot]
+        );
+        $running[$slot] = ['proc' => $proc, 'module' => $module, 'started' => microtime(true), 'log' => $log];
+    }
+
+    usleep(300_000);
+
+    foreach ($running as $slot => $job) {
+        $status  = proc_get_status($job['proc']);
+        $elapsed = microtime(true) - $job['started'];
+        if ($status['running'] && $elapsed > $timeout) {
+            proc_terminate($job['proc'], 9);
+            $results[$job['module']] = [$elapsed, -1, 'TIMED OUT after ' . round($elapsed) . 's'];
+            printf("[%4ds] %-28s slot %-2d TIMED OUT\n", (int) (microtime(true) - $wallStart), $job['module'], $slot);
+            proc_close($job['proc']);
+            unset($running[$slot]);
+            continue;
+        }
+        if (!$status['running']) {
+            proc_close($job['proc']);
+            $summary = $summaryOf($job['log']);
+            $results[$job['module']] = [$elapsed, $status['exitcode'], $summary];
+            printf(
+                "[%4ds] %-28s slot %-2d %6.1fs  exit %-2d %s\n",
+                (int) (microtime(true) - $wallStart),
+                $job['module'],
+                $slot,
+                $elapsed,
+                $status['exitcode'],
+                $summary
+            );
+            unset($running[$slot]);
+        }
+    }
+}
+
+$wall = microtime(true) - $wallStart;
+$sum  = array_sum(array_column($results, 0));
+$bad  = array_filter($results, static fn ($r) => $r[1] !== 0);
+
+echo "\n==================== module-axis summary ====================\n";
+printf("modules:  %d   wall: %s   1-slot sum: %s   speedup: %.1fx\n",
+    count($results),
+    gmdate('H:i:s', (int) $wall),
+    gmdate('H:i:s', (int) $sum),
+    $wall > 0 ? $sum / $wall : 0
+);
+uasort($results, static fn ($a, $b) => $b[0] <=> $a[0]);
+echo "slowest:\n";
+foreach (array_slice($results, 0, 10, true) as $m => $r) {
+    printf("  %6.1fs  %s\n", $r[0], $m);
+}
+if ($bad) {
+    printf("\n%d module(s) not clean:\n", count($bad));
+    foreach ($bad as $m => $r) {
+        printf("  exit %-2d %-28s %s\n", $r[1], $m, $r[2]);
+    }
+    exit(1);
+}
+echo "\nall modules clean\n";
