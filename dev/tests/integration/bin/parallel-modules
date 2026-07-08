@@ -49,8 +49,54 @@ if (!is_dir($logDir)) {
     mkdir($logDir, 0755, true);
 }
 
-// Discover modules, biggest first.
-$queue = [];
+// Known giants, sized from measured runs. SPLIT jobs recurse one level
+// per listed name — a chunk whose name is itself listed splits again —
+// so no single lane dwarfs the rest and a mid-module crash loses one
+// chunk, not the module. EXTRA_TIME jobs can't usefully split further
+// (Tax is one parameterized class) or just barely miss the default cap
+// under load, so they get a longer leash; split-module chunks inherit
+// their parent's leash.
+const SPLIT_MODULES = ['Catalog', 'Bundle', 'Catalog/Model', 'Bundle/Model'];
+const EXTRA_TIME    = [
+    'Tax'                 => 3600,
+    'CatalogImportExport' => 3600,
+    'Catalog'             => 3600,
+    'Bundle'              => 3600,
+];
+
+$countTests = static function (string $dir): int {
+    $count = 0;
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+    foreach ($it as $f) {
+        if ($f->isFile() && str_ends_with($f->getFilename(), 'Test.php')) {
+            $count++;
+        }
+    }
+    return $count;
+};
+
+// Discover jobs, biggest first: name, phpunit path, per-job timeout.
+$jobs = [];
+$addJobs = static function (string $dir, string $name, int $jobTimeout) use (&$addJobs, &$jobs, $countTests): void {
+    if (in_array($name, SPLIT_MODULES, true)) {
+        foreach (new DirectoryIterator($dir) as $sub) {
+            if ($sub->isDot()) {
+                continue;
+            }
+            if ($sub->isDir() && $countTests($sub->getPathname()) > 0) {
+                $addJobs($sub->getPathname(), "$name/{$sub->getFilename()}", $jobTimeout);
+            } elseif ($sub->isFile() && str_ends_with($sub->getFilename(), 'Test.php')) {
+                $addJobs($sub->getPathname(), "$name/{$sub->getBasename('.php')}", $jobTimeout);
+            }
+        }
+        return;
+    }
+    $jobs[$name] = [
+        'path'    => 'testsuite/Magento/' . substr($dir, strpos($dir, '/testsuite/Magento/') + strlen('/testsuite/Magento/')),
+        'timeout' => $jobTimeout,
+        'files'   => is_dir($dir) ? $countTests($dir) : 1,
+    ];
+};
 foreach (new DirectoryIterator("$root/testsuite/Magento") as $entry) {
     if (!$entry->isDir() || $entry->isDot()) {
         continue;
@@ -59,24 +105,17 @@ foreach (new DirectoryIterator("$root/testsuite/Magento") as $entry) {
     if ($only && !in_array($name, $only, true)) {
         continue;
     }
-    $count = 0;
-    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($entry->getPathname()));
-    foreach ($it as $f) {
-        if ($f->isFile() && str_ends_with($f->getFilename(), 'Test.php')) {
-            $count++;
-        }
-    }
-    if ($count > 0) {
-        $queue[$name] = $count;
+    if ($countTests($entry->getPathname()) > 0) {
+        $addJobs($entry->getPathname(), $name, EXTRA_TIME[$name] ?? $timeout);
     }
 }
-arsort($queue);
-$queue = array_keys($queue);
+uasort($jobs, static fn ($a, $b) => $b['files'] <=> $a['files']);
+$queue = array_keys($jobs);
 if (!$queue) {
     fwrite(STDERR, "no modules matched\n");
     exit(1);
 }
-printf("%d modules, %d workers, timeout %ds/module\n", count($queue), $workers, $timeout);
+printf("%d jobs, %d workers, timeout %ds default\n", count($queue), $workers, $timeout);
 
 // Between modules a slot's database is reset to template state with a
 // data-only script: DELETE every table + replay the template dump's
@@ -157,11 +196,11 @@ while ($queue || $running) {
             continue;
         }
         $module = array_shift($queue);
-        $log = "$logDir/$module.log";
+        $log = "$logDir/" . str_replace('/', '--', $module) . '.log';
         // `exec` so the shell is replaced by phpunit and a timeout
         // proc_terminate() reaches the real process, not a wrapper shell.
         $cmd = 'exec ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($phpunit)
-            . ' -c phpunit-parallel.xml ' . escapeshellarg("testsuite/Magento/$module");
+            . ' -c phpunit-parallel.xml ' . escapeshellarg($jobs[$module]['path']);
         // Reset the slot to template state before every module — data,
         // AUTO_INCREMENT counters, and sandbox var/ (see reset-worker).
         // Unconditional so a run is immune to whatever state the previous
@@ -183,7 +222,7 @@ while ($queue || $running) {
     foreach ($running as $slot => $job) {
         $status  = proc_get_status($job['proc']);
         $elapsed = microtime(true) - $job['started'];
-        if ($status['running'] && $elapsed > $timeout) {
+        if ($status['running'] && $elapsed > $jobs[$job['module']]['timeout']) {
             proc_terminate($job['proc'], 9);
             $results[$job['module']] = [$elapsed, -1, 'TIMED OUT after ' . round($elapsed) . 's'];
             printf("[%4ds] %-28s slot %-2d TIMED OUT\n", (int) (microtime(true) - $wallStart), $job['module'], $slot);
@@ -214,7 +253,7 @@ $sum  = array_sum(array_column($results, 0));
 $bad  = array_filter($results, static fn ($r) => $r[1] !== 0);
 
 echo "\n==================== module-axis summary ====================\n";
-printf("modules:  %d   wall: %s   1-slot sum: %s   speedup: %.1fx\n",
+printf("jobs:  %d   wall: %s   1-slot sum: %s   speedup: %.1fx\n",
     count($results),
     gmdate('H:i:s', (int) $wall),
     gmdate('H:i:s', (int) $sum),

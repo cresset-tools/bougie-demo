@@ -68,14 +68,31 @@ $triggers = $run('-N ' . escapeshellarg($db) . ' -e ' . escapeshellarg(
 foreach (array_filter(array_map('trim', explode("\n", $triggers))) as $trigger) {
     $pre .= "DROP TRIGGER IF EXISTS `$trigger`;\n";
 }
-foreach (array_filter(array_map('trim', explode("\n", $live))) as $liveTable) {
-    $pre .= isset($templateTables[$liveTable])
-        ? "DELETE FROM `$liveTable`;\n"
-        : "DROP TABLE `$liveTable`;\n";
-}
+$liveTables = array_filter(array_map('trim', explode("\n", $live)));
+$missing = array_diff(array_keys($templateTables), $liveTables);
 $preFile = "$logDir/.reconcile-t$slot.sql";
-file_put_contents($preFile, $pre);
-$run(escapeshellarg($db), $preFile);
+if ($missing) {
+    // Template tables have vanished (e.g. the server was killed mid-DDL,
+    // which loses the table a TRUNCATE was rebuilding): the incremental
+    // reset can't recover schema, so drop everything and reload the
+    // template dump — the slow path, but self-healing.
+    fwrite(STDERR, 'reset-worker: slot ' . $slot . ': ' . count($missing)
+        . " template table(s) missing, reloading dump\n");
+    foreach ($liveTables as $liveTable) {
+        $pre .= "DROP TABLE `$liveTable`;\n";
+    }
+    file_put_contents($preFile, $pre);
+    $run(escapeshellarg($db), $preFile);
+    $run(escapeshellarg($db), "$root/tmp/sandbox-0-$hash/setup_dump_$base.sql");
+} else {
+    foreach ($liveTables as $liveTable) {
+        $pre .= isset($templateTables[$liveTable])
+            ? "DELETE FROM `$liveTable`;\n"
+            : "DROP TABLE `$liveTable`;\n";
+    }
+    file_put_contents($preFile, $pre);
+    $run(escapeshellarg($db), $preFile);
+}
 
 $run(escapeshellarg($db), "$logDir/.reset-t$slot.sql");
 
@@ -95,6 +112,16 @@ foreach (array_filter(explode("\n", $current)) as $line) {
 if ($alters !== '') {
     $run(escapeshellarg($db) . ' -e ' . escapeshellarg($alters));
 }
+
+// env.php is worker state Magento itself rewrites during tests; a killed
+// process can leave it corrupt (observed: `<?php return null;`).
+// Regenerate it from the template install every reset.
+$env = include "$root/tmp/sandbox-0-$hash/etc/env.php";
+$env['db']['connection']['default']['dbname'] = $db;
+file_put_contents(
+    "$root/tmp/sandbox-{$slot}-{$hash}/etc/env.php",
+    "<?php\nreturn " . var_export($env, true) . ";\n"
+);
 
 exec('rm -rf ' . escapeshellarg("$root/tmp/sandbox-{$slot}-{$hash}/var") . '/*');
 
