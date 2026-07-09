@@ -38,7 +38,8 @@
       },
       "mage-os/magento2-base": {
         "Integration test framework: mariadb CLI tools accept a Unix-socket db-host": "patches/testframework-db-mysql-unix-socket.patch",
-        "Integration test framework: parallel workers skip the racy test-module redeploy": "patches/testframework-parallel-deploy-test-modules.patch"
+        "Integration test framework: parallel workers skip the racy test-module redeploy": "patches/testframework-parallel-deploy-test-modules.patch",
+        "Integration test framework: fixture-revert failures warn instead of aborting the run": "patches/testframework-nonfatal-fixture-revert.patch"
       }
     }
   },
