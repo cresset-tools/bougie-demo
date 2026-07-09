@@ -123,8 +123,22 @@ for ($t = 1; $t <= $workers; $t++) {
         passthru('rm -rf ' . escapeshellarg("$dest/$dir"));
     }
 
+    // Per-worker RabbitMQ vhost: queue names are identical across workers,
+    // so on a shared vhost consumers steal each other's messages and a
+    // killed run's zombie consumers eat later runs' RPC replies.
+    $amqpVhost = getenv('BOUGIE_SERVICE_RABBITMQ_VHOST');
+    $amqpUser  = getenv('BOUGIE_SERVICE_RABBITMQ_USER');
+    if ($amqpVhost && $amqpUser) {
+        exec('rabbitmqctl -q add_vhost ' . escapeshellarg("{$amqpVhost}_t{$t}") . ' 2>/dev/null');
+        exec('rabbitmqctl -q set_permissions -p ' . escapeshellarg("{$amqpVhost}_t{$t}")
+            . ' ' . escapeshellarg($amqpUser) . " '.*' '.*' '.*'");
+    }
+
     $env = include "$dest/etc/env.php";
     $env['db']['connection']['default']['dbname'] = $db;
+    if ($amqpVhost && isset($env['queue']['amqp'])) {
+        $env['queue']['amqp']['virtualhost'] = "{$amqpVhost}_t{$t}";
+    }
     file_put_contents("$dest/etc/env.php", "<?php\nreturn " . var_export($env, true) . ";\n");
 
     echo "worker $t: $db + " . basename($dest) . "\n";

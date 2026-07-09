@@ -113,11 +113,35 @@ if ($alters !== '') {
     $run(escapeshellarg($db) . ' -e ' . escapeshellarg($alters));
 }
 
+// AMQP hygiene, all scoped to this worker. Leaked queue:consumers:start
+// processes from a killed run keep consuming — they eat later runs' RPC
+// replies and MessageQueue tests hang forever waiting. Identify this
+// worker's consumers by TEST_TOKEN in their environment, then recreate
+// the worker's own vhost so stale messages and drifted topology go too.
+$amqpVhost = getenv('BOUGIE_SERVICE_RABBITMQ_VHOST');
+$amqpUser  = getenv('BOUGIE_SERVICE_RABBITMQ_USER');
+if ($amqpVhost && $amqpUser) {
+    exec("pgrep -f 'queue:consumers:start'", $consumerPids);
+    foreach ($consumerPids as $pid) {
+        $environ = @file_get_contents("/proc/$pid/environ");
+        if ($environ !== false && str_contains($environ, "TEST_TOKEN=$slot\0")) {
+            exec('kill -9 ' . (int) $pid);
+        }
+    }
+    $workerVhost = escapeshellarg("{$amqpVhost}_t{$slot}");
+    exec("rabbitmqctl -q delete_vhost $workerVhost 2>/dev/null");
+    exec("rabbitmqctl -q add_vhost $workerVhost");
+    exec("rabbitmqctl -q set_permissions -p $workerVhost " . escapeshellarg($amqpUser) . " '.*' '.*' '.*'");
+}
+
 // env.php is worker state Magento itself rewrites during tests; a killed
 // process can leave it corrupt (observed: `<?php return null;`).
 // Regenerate it from the template install every reset.
 $env = include "$root/tmp/sandbox-0-$hash/etc/env.php";
 $env['db']['connection']['default']['dbname'] = $db;
+if ($amqpVhost && isset($env['queue']['amqp'])) {
+    $env['queue']['amqp']['virtualhost'] = "{$amqpVhost}_t{$slot}";
+}
 file_put_contents(
     "$root/tmp/sandbox-{$slot}-{$hash}/etc/env.php",
     "<?php\nreturn " . var_export($env, true) . ";\n"
