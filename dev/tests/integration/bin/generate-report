@@ -1,16 +1,17 @@
 #!/usr/bin/env php
 <?php
 /**
- * Static report generator for a parallel-modules run.
+ * Static report generator for a parallel-modules run — multi-page.
  *
  * Reads tmp/parallel-logs/*.junit.xml + diagnosis.json, writes:
- *   - <baseline-repo>/baselines/<sha>.json  (per-test status/time/diagnosis;
- *     the git history of these files IS the per-test history database)
- *   - <out>/<sha>/index.html                (the run report)
- *   - <out>/index.html                      (runs index)
+ *   - <baseline-repo>/baselines/<sha>.json       per-test status/time/diagnosis
+ *     (the git history of these files IS the per-test history database)
+ *   - <out>/<sha>/index.html                     run overview
+ *   - <out>/<sha>/jobs/<slug>.html               full test listing per job
+ *   - <out>/index.html                           runs index
  *
- * No dependencies: syntax highlighting via PHP's highlight_string(),
- * history sparklines from the last 30 baseline files.
+ * No dependencies: highlighting via highlight_string(), sparklines from
+ * the last 30 baseline files.
  *
  * Usage: php bin/generate-report --sha <sha> --out <dir> --baselines <dir>
  */
@@ -29,14 +30,14 @@ if (!$sha || !$out || !$baseDir) {
 }
 $root   = dirname(__DIR__);
 $logDir = "$root/tmp/parallel-logs";
-@mkdir("$out/$sha", 0755, true);
+@mkdir("$out/$sha/jobs", 0755, true);
 @mkdir("$baseDir/baselines", 0755, true);
 
-// ---- gather ---------------------------------------------------------------
+// ---- gather -----------------------------------------------------------------
 $diagnosis = json_decode((string) @file_get_contents("$logDir/diagnosis.json"), true) ?: [];
 
-$jobs  = [];   // job slug => [tests, failures, errors, skipped, time]
-$tests = [];   // id => [s(tatus), t(ime), file, line, msg, kind]
+$jobs  = [];   // slug => [tests, failures, errors, skipped, time, ids => []]
+$tests = [];   // id => [s, t, file, line, msg, job]
 foreach (glob("$logDir/*.junit.xml") as $junit) {
     if (str_contains($junit, '.ladder.')) {
         continue;
@@ -53,6 +54,7 @@ foreach (glob("$logDir/*.junit.xml") as $junit) {
         'errors'   => (int) $s['errors'],
         'skipped'  => (int) $s['skipped'],
         'time'     => (float) $s['time'],
+        'ids'      => [],
     ];
     foreach ($xml->xpath('//testcase') as $case) {
         $id = (string) $case['classname'] . '::' . (string) $case['name'];
@@ -75,35 +77,30 @@ foreach (glob("$logDir/*.junit.xml") as $junit) {
             'file' => $classFile,
             'line' => (int) $case['line'],
             'msg'  => $msg,
+            'job'  => $slug,
         ];
+        $jobs[$slug]['ids'][] = $id;
     }
 }
 if (!$tests) {
     fwrite(STDERR, "no junit files found in $logDir\n");
     exit(1);
 }
+ksort($jobs);
 
-// ---- baseline -------------------------------------------------------------
+// ---- baseline -----------------------------------------------------------------
 $baselineTests = [];
 foreach ($tests as $id => $t) {
-    $baselineTests[$id] = [
-        's' => $t['s'],
-        't' => $t['t'],
-    ];
+    $baselineTests[$id] = ['s' => $t['s'], 't' => $t['t']];
     if (isset($diagnosis[$id]['diagnosis'])) {
         $baselineTests[$id]['d'] = $diagnosis[$id]['diagnosis'];
     }
 }
-$baseline = [
-    'schema' => 1,
-    'sha'    => $sha,
-    'date'   => date('c'),
-    'tests'  => $baselineTests,
-];
-file_put_contents("$baseDir/baselines/$sha.json", json_encode($baseline) . "\n");
+file_put_contents(
+    "$baseDir/baselines/$sha.json",
+    json_encode(['schema' => 1, 'sha' => $sha, 'date' => date('c'), 'tests' => $baselineTests]) . "\n"
+);
 
-// history: previous baselines by git commit order of the baselines dir,
-// falling back to file mtime order.
 $history = [];
 $files = glob("$baseDir/baselines/*.json");
 usort($files, fn ($a, $b) => filemtime($a) <=> filemtime($b));
@@ -118,10 +115,15 @@ foreach (array_slice($files, -31) as $f) {
 }
 $prev = $history ? end($history) : null;
 
-// ---- render helpers --------------------------------------------------------
+// ---- helpers --------------------------------------------------------------------
 function h(string $s): string
 {
     return htmlspecialchars($s, ENT_QUOTES);
+}
+
+function anchor(string $id): string
+{
+    return 't-' . substr(sha1($id), 0, 12);
 }
 
 function snippet(string $file, int $line): string
@@ -146,7 +148,6 @@ function fixtures(string $file, int $line): array
     }
     $lines = file($file);
     $out = [];
-    // scan the docblock immediately above the test method line
     for ($i = min($line, count($lines)) - 2; $i >= 0 && $i > $line - 40; $i--) {
         $l = trim($lines[$i]);
         if (preg_match('/@magento(Data|Api?Data|Config)Fixture\s+(.+)/', $l, $m)) {
@@ -161,51 +162,54 @@ function fixtures(string $file, int $line): array
 
 function spark(array $history, string $id): string
 {
+    if (!$history) {
+        return '';
+    }
     $cells = '';
+    $interesting = false;
     foreach ($history as $b) {
         $s = $b['tests'][$id]['s'] ?? null;
+        if ($s !== 'pass' && $s !== null) {
+            $interesting = true;
+        }
         $cls = match ($s) {
             'pass' => 'p', 'fail', 'error' => 'f', 'skip' => 's', default => 'n',
         };
         $cells .= "<i class=\"$cls\" title=\"" . h(substr($b['sha'], 0, 10) . ' ' . ($s ?? 'not run')) . '"></i>';
     }
-    return "<span class=\"spark\">$cells</span>";
+    return $interesting ? "<span class=\"spark\">$cells</span>" : '';
 }
 
-// ---- classify + aggregate ---------------------------------------------------
-$failing = array_filter($tests, fn ($t) => $t['s'] === 'fail' || $t['s'] === 'error');
-uksort($failing, function ($a, $b) use ($diagnosis) {
-    $rank = fn ($id) => match ($diagnosis[$id]['diagnosis'] ?? 'undiagnosed') {
-        'deterministic' => 0, 'flaky' => 1, 'context-dependent' => 2, default => 3,
-    };
-    return [$rank($a), $a] <=> [$rank($b), $b];
-});
-$newFailures = [];
-foreach ($failing as $id => $t) {
-    $prevStatus = $prev['tests'][$id]['s'] ?? null;
-    if ($prevStatus === 'pass') {
-        $newFailures[$id] = true;
+function failureDetail(string $id, array $t, array $diagnosis, array $newFailures, array $history): string
+{
+    $d = $diagnosis[$id]['diagnosis'] ?? 'undiagnosed';
+    $html = '<p><span class="badge b-' . h($d) . '">' . h($d) . '</span> ';
+    if (isset($newFailures[$id])) {
+        $html .= '<span class="badge b-new">new</span> ';
     }
+    $sp = spark($history, $id);
+    $html .= $sp . ' <small>' . $t['t'] . 's</small></p>';
+    foreach (fixtures($t['file'], $t['line']) as $fx) {
+        $html .= '<div class=fx>' . h($fx) . '</div>';
+    }
+    $html .= '<pre class=msg>' . h(mb_substr($t['msg'], 0, 4000)) . '</pre>';
+    $html .= snippet($t['file'], $t['line']);
+    return $html;
 }
-$totTests = count($tests);
-$totFail  = count($failing);
-$totSkip  = count(array_filter($tests, fn ($t) => $t['s'] === 'skip'));
-$totTime  = array_sum(array_column($jobs, 'time'));
-ksort($jobs);
-$slowest = $tests;
-uasort($slowest, fn ($a, $b) => $b['t'] <=> $a['t']);
-$slowest = array_slice($slowest, 0, 20, true);
 
-// ---- run page ----------------------------------------------------------------
 $css = <<<'CSS'
 body{font:14px/1.5 system-ui,sans-serif;margin:0;background:#f6f7f9;color:#1a1f27}
 main{max-width:1100px;margin:0 auto;padding:24px}
 h1{font-size:20px} h2{font-size:16px;margin-top:32px}
+h1 code,h1 small{font-weight:400;color:#5c6675}
+a{color:#25508f}
+.crumb{font-size:13px;margin-bottom:14px}
 .tot{display:flex;gap:20px;flex-wrap:wrap;margin:12px 0}
 .tot b{font-size:22px;display:block}
 .tot div{background:#fff;border:1px solid #e2e5ea;border-radius:8px;padding:10px 16px}
 table{border-collapse:collapse;width:100%;background:#fff;border:1px solid #e2e5ea;border-radius:8px}
 th,td{padding:6px 10px;text-align:left;border-top:1px solid #eef0f3;font-size:13px}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px}
 .grid a{display:flex;justify-content:space-between;padding:5px 9px;border-radius:6px;font-size:12.5px;
   text-decoration:none;color:inherit;background:#e7f5ec;border:1px solid #bfe3cd}
@@ -223,77 +227,133 @@ pre.msg{background:#20242c;color:#e6e8ee;padding:10px;border-radius:6px;overflow
 .fx{font:12px ui-monospace,monospace;color:#5b4b8a;margin:4px 0}
 .spark i{display:inline-block;width:7px;height:14px;margin-right:1px;border-radius:1.5px;vertical-align:middle}
 .spark .p{background:#66bb6a}.spark .f{background:#e53935}.spark .s{background:#cfd8dc}.spark .n{background:#eceff1}
+.st{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:baseline}
+.st-pass{background:#66bb6a}.st-fail,.st-error{background:#e53935}.st-skip{background:#b0bec5}
+tr.rf td{background:#fff6f6}
+td .tid{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
+details{margin:4px 0 8px}
+details summary{cursor:pointer;font-size:12.5px;color:#25508f}
 CSS;
 
-$mono = fn ($s) => '<code>' . h($s) . '</code>';
-$html = "<!doctype html><meta charset=utf-8><title>mageos-magento2 @ " . h(substr($sha, 0, 10))
-    . "</title><style>$css</style><main>";
-$html .= '<h1>mageos-magento2 <code>' . h(substr($sha, 0, 12)) . '</code></h1>';
-$html .= '<p>' . h(date('Y-m-d H:i T')) . ' · <a href="https://github.com/mage-os/mageos-magento2/commit/'
-    . h($sha) . '">commit on GitHub</a> · <a href="../index.html">all runs</a></p>';
-$html .= '<div class=tot>'
+$pageOpen = function (string $title, string $crumb) use ($css): string {
+    return "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+        . '<title>' . h($title) . "</title><style>$css</style><main><div class=crumb>$crumb</div>";
+};
+
+// ---- classify ------------------------------------------------------------------
+$failing = array_filter($tests, fn ($t) => $t['s'] === 'fail' || $t['s'] === 'error');
+uksort($failing, function ($a, $b) use ($diagnosis) {
+    $rank = fn ($id) => match ($diagnosis[$id]['diagnosis'] ?? 'undiagnosed') {
+        'deterministic' => 0, 'flaky' => 1, 'context-dependent' => 2, default => 3,
+    };
+    return [$rank($a), $a] <=> [$rank($b), $b];
+});
+$newFailures = [];
+foreach ($failing as $id => $t) {
+    if (($prev['tests'][$id]['s'] ?? null) === 'pass') {
+        $newFailures[$id] = true;
+    }
+}
+$totTests = count($tests);
+$totFail  = count($failing);
+$totSkip  = count(array_filter($tests, fn ($t) => $t['s'] === 'skip'));
+$totTime  = array_sum(array_column($jobs, 'time'));
+
+// ---- job pages -------------------------------------------------------------------
+foreach ($jobs as $slug => $j) {
+    $name = str_replace('--', '/', $slug);
+    $crumb = '<a href="../../index.html">runs</a> › <a href="../index.html">'
+        . h(substr($sha, 0, 12)) . '</a> › ' . h($name);
+    $p = $pageOpen("$name @ " . substr($sha, 0, 10), $crumb);
+    $bad = $j['failures'] + $j['errors'];
+    $p .= '<h1>' . h($name) . ' <small>' . $j['tests'] . ' tests · '
+        . ($bad ? "<b style=\"color:#c62828\">$bad failing</b>" : '<b style="color:#2e7d32">green</b>')
+        . ' · ' . $j['skipped'] . ' skipped · ' . gmdate('i:s', (int) $j['time']) . '</small></h1>';
+
+    // failing first, then the rest in run order
+    $ids = $j['ids'];
+    usort($ids, function ($a, $b) use ($tests) {
+        $bad = fn ($id) => in_array($tests[$id]['s'], ['fail', 'error'], true) ? 0 : 1;
+        return [$bad($a), $a] <=> [$bad($b), $b];
+    });
+    $p .= '<table><tr><th>test</th><th class=num>seconds</th><th>history</th></tr>';
+    foreach ($ids as $id) {
+        $t = $tests[$id];
+        $isBad = in_array($t['s'], ['fail', 'error'], true);
+        $p .= '<tr' . ($isBad ? ' class=rf' : '') . ' id="' . anchor($id) . '"><td>'
+            . '<span class="st st-' . $t['s'] . '"></span><span class=tid>' . h($id) . '</span>';
+        if ($isBad) {
+            $p .= '<details><summary>details</summary>'
+                . failureDetail($id, $t, $diagnosis, $newFailures, $history) . '</details>';
+        }
+        $p .= '</td><td class=num>' . number_format($t['t'], 2) . '</td><td>'
+            . spark($history, $id) . '</td></tr>';
+    }
+    $p .= '</table></main>';
+    file_put_contents("$out/$sha/jobs/$slug.html", $p);
+}
+
+// ---- run overview -------------------------------------------------------------------
+$p = $pageOpen('mageos-magento2 @ ' . substr($sha, 0, 10), '<a href="../index.html">runs</a> › ' . h(substr($sha, 0, 12)));
+$p .= '<h1>mageos-magento2 <code>' . h(substr($sha, 0, 12)) . '</code></h1>';
+$p .= '<p>' . h(date('Y-m-d H:i T')) . ' · <a href="https://github.com/mage-os/mageos-magento2/commit/'
+    . h($sha) . '">commit on GitHub</a></p>';
+$p .= '<div class=tot>'
     . '<div><b>' . number_format($totTests) . '</b>tests</div>'
     . '<div><b style="color:' . ($totFail ? '#c62828' : '#2e7d32') . '">' . $totFail . '</b>failing</div>'
     . '<div><b>' . count($newFailures) . '</b>new vs previous run</div>'
     . '<div><b>' . $totSkip . '</b>skipped</div>'
     . '<div><b>' . gmdate('H:i:s', (int) $totTime) . '</b>test time (sum)</div></div>';
 
-// module grid
-$html .= '<h2>Jobs</h2><div class=grid>';
+$p .= '<h2>Jobs</h2><div class=grid>';
 foreach ($jobs as $slug => $j) {
     $bad = $j['failures'] + $j['errors'];
     $cls = $bad ? 'bad' : ($j['tests'] === 0 ? 'warn' : '');
-    $html .= "<a class=\"$cls\" href=\"#" . h($slug) . '"><span>' . h(str_replace('--', '/', $slug))
-        . "</span><span>" . ($bad ? "$bad ✗" : '✓') . '</span></a>';
+    $p .= "<a class=\"$cls\" href=\"jobs/" . h($slug) . '.html"><span>' . h(str_replace('--', '/', $slug))
+        . '</span><span>' . ($bad ? "$bad ✗" : '✓') . '</span></a>';
 }
-$html .= '</div>';
+$p .= '</div>';
 
-// failing tests
-$html .= '<h2>Failing tests (' . $totFail . ')</h2>';
+$p .= '<h2>Failing tests (' . $totFail . ')</h2>';
 if (!$failing) {
-    $html .= '<p><b style="color:#2e7d32">Suite is green.</b></p>';
+    $p .= '<p><b style="color:#2e7d32">Suite is green.</b></p>';
 }
 foreach ($failing as $id => $t) {
-    $d = $diagnosis[$id]['diagnosis'] ?? 'undiagnosed';
-    $html .= '<div class=fail id="' . h(explode('::', $id)[0]) . '">';
-    $html .= '<h3>' . h($id) . '</h3>';
-    $html .= '<p><span class="badge b-' . h($d) . '">' . h($d) . '</span> ';
-    if (isset($newFailures[$id])) {
-        $html .= '<span class="badge b-new">new</span> ';
-    }
-    $html .= spark($history, $id) . ' <small>' . $t['t'] . 's</small></p>';
-    foreach (fixtures($t['file'], $t['line']) as $fx) {
-        $html .= '<div class=fx>' . h($fx) . '</div>';
-    }
-    $html .= '<pre class=msg>' . h(mb_substr($t['msg'], 0, 4000)) . '</pre>';
-    $html .= snippet($t['file'], $t['line']);
-    $html .= '</div>';
+    $p .= '<div class=fail><h3><a href="jobs/' . h($t['job']) . '.html#' . anchor($id) . '">' . h($id) . '</a></h3>'
+        . failureDetail($id, $t, $diagnosis, $newFailures, $history) . '</div>';
 }
 
-// slowest
-$html .= '<h2>Slowest tests</h2><table><tr><th>seconds</th><th>test</th></tr>';
-foreach ($slowest as $id => $t) {
-    $html .= '<tr><td>' . number_format($t['t'], 1) . '</td><td>' . $mono($id) . '</td></tr>';
+$slowest = $tests;
+uasort($slowest, fn ($a, $b) => $b['t'] <=> $a['t']);
+$p .= '<h2>Slowest tests</h2><table><tr><th class=num>seconds</th><th>test</th></tr>';
+foreach (array_slice($slowest, 0, 20, true) as $id => $t) {
+    $p .= '<tr><td class=num>' . number_format($t['t'], 1) . '</td><td><a href="jobs/' . h($t['job'])
+        . '.html#' . anchor($id) . '"><span class=tid>' . h($id) . '</span></a></td></tr>';
 }
-$html .= '</table></main>';
-file_put_contents("$out/$sha/index.html", $html);
+$p .= '</table></main>';
+file_put_contents("$out/$sha/index.html", $p);
 
-// ---- runs index ----------------------------------------------------------------
+// ---- runs index -----------------------------------------------------------------------
 $runsFile = "$out/runs.json";
 $runs = json_decode((string) @file_get_contents($runsFile), true) ?: [];
 $runs = array_values(array_filter($runs, fn ($r) => $r['sha'] !== $sha));
 $runs[] = ['sha' => $sha, 'date' => date('c'), 'tests' => $totTests, 'failing' => $totFail, 'new' => count($newFailures)];
 file_put_contents($runsFile, json_encode($runs, JSON_PRETTY_PRINT) . "\n");
 
-$idx = "<!doctype html><meta charset=utf-8><title>mageos-magento2 integration tests</title><style>$css</style><main>";
-$idx .= '<h1>mageos-magento2 · integration test runs</h1><table><tr><th>date</th><th>commit</th><th>tests</th><th>failing</th><th>new</th></tr>';
+$idx = $pageOpen('mageos-magento2 integration tests', 'mage-os/mageos-magento2 · main');
+$idx .= '<h1>mageos-magento2 · integration test runs</h1>'
+    . '<table><tr><th>date</th><th>commit</th><th class=num>tests</th><th class=num>failing</th><th class=num>new</th></tr>';
 foreach (array_reverse($runs) as $r) {
     $color = $r['failing'] ? '#c62828' : '#2e7d32';
     $idx .= '<tr><td>' . h(substr($r['date'], 0, 16)) . '</td><td><a href="' . h($r['sha']) . '/index.html"><code>'
-        . h(substr($r['sha'], 0, 12)) . '</code></a></td><td>' . number_format($r['tests'])
-        . "</td><td style=\"color:$color;font-weight:600\">" . $r['failing'] . '</td><td>' . $r['new'] . '</td></tr>';
+        . h(substr($r['sha'], 0, 12)) . '</code></a></td><td class=num>' . number_format($r['tests'])
+        . "</td><td class=num style=\"color:$color;font-weight:600\">" . $r['failing']
+        . '</td><td class=num>' . $r['new'] . '</td></tr>';
 }
 $idx .= '</table></main>';
 file_put_contents("$out/index.html", $idx);
 
-printf("report: %s/%s/index.html  (%d tests, %d failing, %d new)\n", $out, $sha, $totTests, $totFail, count($newFailures));
+printf(
+    "report: %s/%s/index.html  (%d tests, %d failing, %d new, %d job pages)\n",
+    $out, $sha, $totTests, $totFail, count($newFailures), count($jobs)
+);
