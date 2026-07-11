@@ -196,11 +196,15 @@ while ($queue || $running) {
             continue;
         }
         $module = array_shift($queue);
-        $log = "$logDir/" . str_replace('/', '--', $module) . '.log';
+        $slug = str_replace('/', '--', $module);
+        $log = "$logDir/$slug.log";
         // `exec` so the shell is replaced by phpunit and a timeout
         // proc_terminate() reaches the real process, not a wrapper shell.
+        // JUnit XML per job carries the per-test identities, statuses,
+        // times, and file paths the report generator and retry ladder need.
         $cmd = 'exec ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($phpunit)
-            . ' -c phpunit-parallel.xml ' . escapeshellarg($jobs[$module]['path']);
+            . ' -c phpunit-parallel.xml --log-junit ' . escapeshellarg("$logDir/$slug.junit.xml")
+            . ' ' . escapeshellarg($jobs[$module]['path']);
         // Reset the slot to template state before every module — data,
         // AUTO_INCREMENT counters, and sandbox var/ (see reset-worker).
         // Unconditional so a run is immune to whatever state the previous

@@ -1,0 +1,170 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Retry ladder: diagnose failing tests instead of merely retrying them.
+ *
+ * Reads the per-job JUnit XML a parallel-modules run left in
+ * tmp/parallel-logs/, groups failing tests by class file, and reruns each
+ * class through a ladder that varies one dimension per step:
+ *
+ *   1. clean solo run on slot A (fresh reset)  — still fails?
+ *        -> deterministic (fails alone on clean state)
+ *   2. clean solo run on slot B                — only if step 1 passed
+ *        passes too   -> context-dependent (failed only inside the full
+ *                        run: leaked state, ordering, or contention)
+ *        fails        -> flaky (nondeterministic on clean state)
+ *
+ * Emits tmp/parallel-logs/diagnosis.json mapping each failing test id
+ * (classname::name) to {diagnosis, message, file, evidence}. The report
+ * generator merges this into the run page; the ratchet treats only
+ * `deterministic` failures as blocking.
+ *
+ * Usage (from dev/tests/integration, under `bougie run`):
+ *   php bin/diagnose-failures [--slots A,B] [--max N]
+ */
+
+$slots = [1, 2];
+$max   = 40;
+for ($i = 1; $i < $argc; $i++) {
+    switch ($argv[$i]) {
+        case '--slots': $slots = array_map('intval', explode(',', $argv[++$i])); break;
+        case '--max':   $max   = (int) $argv[++$i]; break;
+    }
+}
+if (!getenv('BOUGIE_SERVICE_MARIADB_DATABASE')) {
+    fwrite(STDERR, "run me under `bougie run`\n");
+    exit(2);
+}
+
+$root    = dirname(__DIR__);
+$logDir  = "$root/tmp/parallel-logs";
+$phpunit = "$root/../../../vendor/bin/phpunit";
+
+// ---- collect failing testcases from the run's junit files -----------------
+$collect = static function (string $junitFile): array {
+    $failing = [];
+    $xml = @simplexml_load_file($junitFile);
+    if ($xml === false) {
+        return $failing;
+    }
+    foreach ($xml->xpath('//testcase[failure or error]') as $case) {
+        $classFile = (string) $case['file'];
+        if ($classFile === '' ) {
+            // file attr lives on the wrapping class-level testsuite
+            $parents = $case->xpath('ancestor::testsuite[@file][1]');
+            $classFile = $parents ? (string) $parents[0]['file'] : '';
+        }
+        $node = $case->failure ?? $case->error;
+        $failing[] = [
+            'id'      => (string) $case['classname'] . '::' . (string) $case['name'],
+            'class'   => (string) $case['classname'],
+            'name'    => (string) $case['name'],
+            'file'    => $classFile,
+            'line'    => (string) $case['line'],
+            'time'    => (float) $case['time'],
+            'kind'    => isset($case->error) ? 'error' : 'failure',
+            'message' => trim((string) $node),
+        ];
+    }
+    return $failing;
+};
+
+$failures = [];
+foreach (glob("$logDir/*.junit.xml") as $junit) {
+    if (str_contains($junit, '.ladder.')) {
+        continue;
+    }
+    foreach ($collect($junit) as $f) {
+        $failures[$f['id']] = $f;
+    }
+}
+if (!$failures) {
+    file_put_contents("$logDir/diagnosis.json", "{}\n");
+    echo "no failures to diagnose\n";
+    exit(0);
+}
+
+// ---- ladder, class-file granularity ---------------------------------------
+$byFile = [];
+foreach ($failures as $f) {
+    if ($f['file'] !== '' && str_starts_with($f['file'], $root)) {
+        $byFile[$f['file']][] = $f['id'];
+    }
+}
+$truncated = 0;
+if (count($byFile) > $max) {
+    $truncated = count($byFile) - $max;
+    $byFile = array_slice($byFile, 0, $max, true);
+}
+printf("%d failing test(s) in %d class(es)%s\n", count($failures), count($byFile),
+    $truncated ? " ($truncated classes beyond --max left undiagnosed)" : '');
+
+$runLadderStep = static function (string $classFile, int $slot, string $tag) use ($root, $phpunit, $logDir): ?array {
+    $junit = "$logDir/.ladder.$tag.junit.xml";
+    @unlink($junit);
+    $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg("$root/bin/reset-worker") . ' ' . $slot
+        . ' && TEST_TOKEN=' . $slot . ' timeout 1200 ' . escapeshellarg(PHP_BINARY)
+        . ' ' . escapeshellarg($phpunit) . ' -c phpunit-parallel.xml --log-junit ' . escapeshellarg($junit)
+        . ' ' . escapeshellarg($classFile) . ' > /dev/null 2>&1';
+    exec($cmd, $_, $rc);
+    if (!is_file($junit)) {
+        return null; // crashed or timed out before writing results
+    }
+    $xml = @simplexml_load_file($junit);
+    if ($xml === false) {
+        return null;
+    }
+    $failed = [];
+    foreach ($xml->xpath('//testcase[failure or error]') as $case) {
+        $failed[(string) $case['classname'] . '::' . (string) $case['name']] = true;
+    }
+    return $failed;
+};
+
+$diagnosis = [];
+$n = 0;
+foreach ($byFile as $classFile => $ids) {
+    $n++;
+    $short = basename($classFile);
+    printf("[%d/%d] %s (%d failing) ... ", $n, count($byFile), $short, count($ids));
+
+    $stepA = $runLadderStep($classFile, $slots[0], 'a');
+    if ($stepA === null) {
+        foreach ($ids as $id) {
+            $diagnosis[$id] = 'crash-on-rerun';
+        }
+        echo "crash-on-rerun\n";
+        continue;
+    }
+
+    $stillFailingA = array_values(array_filter($ids, fn ($id) => isset($stepA[$id])));
+    $passedA       = array_values(array_diff($ids, $stillFailingA));
+    foreach ($stillFailingA as $id) {
+        $diagnosis[$id] = 'deterministic';
+    }
+
+    if ($passedA) {
+        $stepB = $runLadderStep($classFile, $slots[1] ?? $slots[0], 'b');
+        foreach ($passedA as $id) {
+            if ($stepB === null) {
+                $diagnosis[$id] = 'flaky';
+            } else {
+                $diagnosis[$id] = isset($stepB[$id]) ? 'flaky' : 'context-dependent';
+            }
+        }
+    }
+    $counts = array_count_values(array_intersect_key($diagnosis, array_flip($ids)));
+    echo implode(', ', array_map(fn ($k, $v) => "$v $k", array_keys($counts), $counts)) . "\n";
+}
+
+// tests whose class file we couldn't resolve
+foreach ($failures as $id => $f) {
+    $diagnosis[$id] ??= 'undiagnosed';
+}
+
+$out = [];
+foreach ($failures as $id => $f) {
+    $out[$id] = $f + ['diagnosis' => $diagnosis[$id]];
+}
+file_put_contents("$logDir/diagnosis.json", json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+printf("wrote %s (%d tests)\n", "$logDir/diagnosis.json", count($out));
