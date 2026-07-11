@@ -67,6 +67,35 @@ function sql(string $client, string $socket, string $sql, ?string $db = null): v
     }
 }
 
+// AMQP prerequisites, once per prime: the tenant user needs the
+// `management` tag (the test framework's Amqp helper asserts topology
+// via the management API using tenant credentials), and the template
+// vhost's install-time topology gets exported so reset-worker can import
+// it into each recreated worker vhost — queues like async.operations.all
+// exist only via setup:install and never self-declare.
+$amqpVhostBase = getenv('BOUGIE_SERVICE_RABBITMQ_VHOST');
+$amqpUserBase  = getenv('BOUGIE_SERVICE_RABBITMQ_USER');
+if ($amqpVhostBase && $amqpUserBase) {
+    exec('rabbitmqctl -q set_user_tags ' . escapeshellarg($amqpUserBase) . ' management');
+    @mkdir("$root/tmp/parallel-logs", 0755, true);
+    $defsFile = "$root/tmp/parallel-logs/.amqp-defs-all.json";
+    exec('rabbitmqctl export_definitions ' . escapeshellarg($defsFile) . ' 2>/dev/null');
+    $defs = json_decode((string) @file_get_contents($defsFile), true) ?: [];
+    $topology = [];
+    foreach (['queues', 'exchanges', 'bindings'] as $kind) {
+        $topology[$kind] = array_values(array_filter(
+            $defs[$kind] ?? [],
+            fn ($e) => ($e['vhost'] ?? null) === $amqpVhostBase
+        ));
+    }
+    file_put_contents("$root/tmp/parallel-logs/.amqp-topology.json", json_encode($topology) . "\n");
+    @unlink($defsFile);
+    printf(
+        "amqp topology export: %d queues, %d exchanges, %d bindings\n",
+        count($topology['queues']), count($topology['exchanges']), count($topology['bindings'])
+    );
+}
+
 // Authoritative refresh of the shared test modules: workers in parallel
 // mode skip the framework's remove+recopy (racy mid-run), so stale
 // modules are cleared here and the first worker re-copies them under the

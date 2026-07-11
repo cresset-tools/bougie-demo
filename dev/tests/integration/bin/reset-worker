@@ -132,6 +132,21 @@ if ($amqpVhost && $amqpUser) {
     exec("rabbitmqctl -q delete_vhost $workerVhost 2>/dev/null");
     exec("rabbitmqctl -q add_vhost $workerVhost");
     exec("rabbitmqctl -q set_permissions -p $workerVhost " . escapeshellarg($amqpUser) . " '.*' '.*' '.*'");
+    // Restore the install-time topology (exported by parallel-prime from
+    // the template vhost): setup-declared queues like async.operations.all
+    // never self-declare, so an empty vhost fails every UseCase test.
+    $topology = json_decode((string) @file_get_contents("$logDir/.amqp-topology.json"), true);
+    if ($topology) {
+        foreach (['queues', 'exchanges', 'bindings'] as $kind) {
+            foreach ($topology[$kind] as &$entity) {
+                $entity['vhost'] = "{$amqpVhost}_t{$slot}";
+            }
+            unset($entity);
+        }
+        $importFile = "$logDir/.amqp-import-t$slot.json";
+        file_put_contents($importFile, json_encode($topology) . "\n");
+        exec('rabbitmqctl -q import_definitions ' . escapeshellarg($importFile) . ' 2>/dev/null');
+    }
 }
 
 // env.php is worker state Magento itself rewrites during tests; a killed
