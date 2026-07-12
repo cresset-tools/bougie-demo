@@ -201,9 +201,13 @@ while ($queue || $running) {
         // `exec` so the shell is replaced by phpunit and a timeout
         // proc_terminate() reaches the real process, not a wrapper shell.
         // JUnit XML per job carries the per-test identities, statuses,
-        // times, and file paths the report generator and retry ladder need.
+        // times, and file paths the report generator and retry ladder
+        // need; the TeamCity log exists solely because it is the one
+        // PHPUnit format that records SKIP MESSAGES (junit's <skipped/>
+        // is always empty).
         $cmd = 'exec ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($phpunit)
             . ' -c phpunit-parallel.xml --log-junit ' . escapeshellarg("$logDir/$slug.junit.xml")
+            . ' --log-teamcity ' . escapeshellarg("$logDir/$slug.teamcity.txt")
             . ' ' . escapeshellarg($jobs[$module]['path']);
         // Reset the slot to template state before every module — data,
         // AUTO_INCREMENT counters, and sandbox var/ (see reset-worker).

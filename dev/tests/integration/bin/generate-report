@@ -36,6 +36,29 @@ $logDir = "$root/tmp/parallel-logs";
 // ---- gather -----------------------------------------------------------------
 $diagnosis = json_decode((string) @file_get_contents("$logDir/diagnosis.json"), true) ?: [];
 
+// Skip reasons come from the TeamCity logs — the only PHPUnit format that
+// records them (junit's <skipped/> is empty). Suite context carries the
+// class; ids are normalized to junit's dotted classname::name form.
+$skipReasons = [];
+foreach (glob("$logDir/*.teamcity.txt") as $tc) {
+    $suiteStack = [];
+    $fh = fopen($tc, 'r');
+    while (($line = fgets($fh)) !== false) {
+        if (preg_match("/##teamcity\[testSuiteStarted name='((?:[^'|]|\|.)*)'/", $line, $m)) {
+            $suiteStack[] = $m[1];
+        } elseif (str_contains($line, '##teamcity[testSuiteFinished')) {
+            array_pop($suiteStack);
+        } elseif (preg_match("/##teamcity\[testIgnored name='((?:[^'|]|\|.)*)' message='((?:[^'|]|\|.)*)'/", $line, $m)) {
+            $unescape = static fn (string $s): string => strtr($s, [
+                "|'" => "'", '||' => '|', '|n' => "\n", '|r' => "\r", '|[' => '[', '|]' => ']',
+            ]);
+            $suite = str_replace('\\', '.', $unescape(end($suiteStack) ?: ''));
+            $skipReasons[$suite . '::' . $unescape($m[1])] = trim($unescape($m[2]));
+        }
+    }
+    fclose($fh);
+}
+
 $jobs  = [];   // slug => [tests, failures, errors, skipped, time, ids => []]
 $tests = [];   // id => [s, t, file, line, msg, job]
 foreach (glob("$logDir/*.junit.xml") as $junit) {
@@ -231,6 +254,7 @@ pre.msg{background:#20242c;color:#e6e8ee;padding:10px;border-radius:6px;overflow
 .st-pass{background:#66bb6a}.st-fail,.st-error{background:#e53935}.st-skip{background:#b0bec5}
 tr.rf td{background:#fff6f6}
 td .tid{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
+.skipwhy{font-size:11.5px;color:#8a93a3;margin:2px 0 0 16px}
 details{margin:4px 0 8px}
 details summary{cursor:pointer;font-size:12.5px;color:#25508f}
 CSS;
@@ -285,6 +309,8 @@ foreach ($jobs as $slug => $j) {
         if ($isBad) {
             $p .= '<details><summary>details</summary>'
                 . failureDetail($id, $t, $diagnosis, $newFailures, $history) . '</details>';
+        } elseif ($t['s'] === 'skip' && isset($skipReasons[$id])) {
+            $p .= '<div class=skipwhy>' . h($skipReasons[$id]) . '</div>';
         }
         $p .= '</td><td class=num>' . number_format($t['t'], 2) . '</td><td>'
             . spark($history, $id) . '</td></tr>';
@@ -322,6 +348,29 @@ foreach ($failing as $id => $t) {
     $p .= '<div class=fail><h3><a href="jobs/' . h($t['job']) . '.html#' . anchor($id) . '">' . h($id) . '</a></h3>'
         . failureDetail($id, $t, $diagnosis, $newFailures, $history) . '</div>';
 }
+
+// skipped, grouped by reason
+$skipGroups = [];
+foreach ($tests as $id => $t) {
+    if ($t['s'] === 'skip') {
+        $reason = $skipReasons[$id] ?? '(no reason recorded)';
+        $skipGroups[$reason]['n'] = ($skipGroups[$reason]['n'] ?? 0) + 1;
+        $skipGroups[$reason]['example'] ??= $id;
+    }
+}
+uasort($skipGroups, fn ($a, $b) => $b['n'] <=> $a['n']);
+$p .= '<h2>Skipped tests (' . $totSkip . '), by reason</h2>'
+    . '<table><tr><th class=num>count</th><th>reason</th><th>example</th></tr>';
+foreach (array_slice($skipGroups, 0, 40, true) as $reason => $g) {
+    $ex = $g['example'];
+    $p .= '<tr><td class=num>' . $g['n'] . '</td><td>' . h(mb_substr($reason, 0, 160)) . '</td>'
+        . '<td><a href="jobs/' . h($tests[$ex]['job']) . '.html#' . anchor($ex)
+        . '"><span class=tid>' . h(mb_substr($ex, 0, 80)) . '</span></a></td></tr>';
+}
+if (count($skipGroups) > 40) {
+    $p .= '<tr><td class=num>…</td><td>' . (count($skipGroups) - 40) . ' more distinct reasons</td><td></td></tr>';
+}
+$p .= '</table>';
 
 $slowest = $tests;
 uasort($slowest, fn ($a, $b) => $b['t'] <=> $a['t']);
