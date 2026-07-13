@@ -148,6 +148,20 @@ for ($t = 1; $t <= $workers; $t++) {
     // resolves setup_dump_<dbname>.sql), and its caches may embed the
     // template's absolute path — drop them, they rebuild.
     rename("$dest/setup_dump_$base.sql", "$dest/setup_dump_$db.sql");
+
+    // The search-prefix rows above live only in the *live* DB, but the
+    // framework replays this dump (mysql < setup_dump_<db>.sql) on every
+    // restoreFromDbDump — which fires after each `@magentoDbIsolation
+    // disabled` test (the only way to undo committed rows) and on
+    // Indexer\TestCase teardown. A dump without the prefix silently reverts
+    // the worker to the shared default `magento2_*` index namespace, where
+    // parallel reindexes collide (404 / resource_already_exists). Bake the
+    // prefix into the dump so every restore reproduces it.
+    file_put_contents(
+        "$dest/setup_dump_$db.sql",
+        "\n-- parallel: restore the per-worker search index prefix\n$prefixSql\n",
+        FILE_APPEND
+    );
     foreach (['var/cache', 'var/page_cache', 'var/session'] as $dir) {
         passthru('rm -rf ' . escapeshellarg("$dest/$dir"));
     }
