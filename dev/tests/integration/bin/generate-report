@@ -39,6 +39,20 @@ $diagnosis = json_decode((string) @file_get_contents("$logDir/diagnosis.json"), 
 // Skip reasons come from the TeamCity logs — the only PHPUnit format that
 // records them (junit's <skipped/> is empty). Suite context carries the
 // class; ids are normalized to junit's dotted classname::name form.
+//
+// PHPUnit's TeamCity logger wraps a data-provider test in a *nested* suite
+// named after the test method, so for parameterized tests the stack is
+// [ClassFQCN, methodName] and the top is the bare method — not the class.
+// The class is the deepest stack entry that is a FQCN (contains a '\'); a
+// data-provider suite or the outer "CLI Arguments" wrapper never is.
+$classSuite = static function (array $stack): string {
+    for ($i = count($stack) - 1; $i >= 0; $i--) {
+        if (str_contains($stack[$i], '\\')) {
+            return $stack[$i];
+        }
+    }
+    return end($stack) ?: '';
+};
 $skipReasons = [];
 foreach (glob("$logDir/*.teamcity.txt") as $tc) {
     $suiteStack = [];
@@ -52,7 +66,7 @@ foreach (glob("$logDir/*.teamcity.txt") as $tc) {
             $unescape = static fn (string $s): string => strtr($s, [
                 "|'" => "'", '||' => '|', '|n' => "\n", '|r' => "\r", '|[' => '[', '|]' => ']',
             ]);
-            $suite = str_replace('\\', '.', $unescape(end($suiteStack) ?: ''));
+            $suite = str_replace('\\', '.', $unescape($classSuite($suiteStack)));
             $skipReasons[$suite . '::' . $unescape($m[1])] = trim($unescape($m[2]));
         }
     }
