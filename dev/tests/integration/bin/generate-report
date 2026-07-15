@@ -271,6 +271,18 @@ td .tid{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
 .skipwhy{font-size:11.5px;color:#8a93a3;margin:2px 0 0 16px}
 details{margin:4px 0 8px}
 details summary{cursor:pointer;font-size:12.5px;color:#25508f}
+.diff{display:flex;gap:14px;flex-wrap:wrap}
+.diffcol{flex:1 1 320px;min-width:0;background:#fff;border:1px solid #e2e5ea;border-radius:8px;padding:10px 14px}
+.diffcol h3{margin:0 0 8px;font-size:13px}
+.diffcol h3.gained{color:#2e7d32}.diffcol h3.lost{color:#c62828}
+.diffcol ul{margin:0;padding:0;list-style:none}
+.diffcol li{font:12px ui-monospace,monospace;word-break:break-all;padding:3px 0;border-top:1px solid #f0f2f5}
+.diffcol li:first-child{border-top:0}
+.diffcol a{color:#25508f;text-decoration:none}
+.diffcol .none{color:#8a93a3;font-size:12.5px;margin:0}
+.was{font:10.5px system-ui,sans-serif;color:#fff;background:#9aa4b1;border-radius:8px;padding:0 6px;margin-left:4px;white-space:nowrap}
+.was.s-fail,.was.s-error{background:#e53935}.was.s-skip{background:#b0bec5}
+.skipdelta{font-size:12px;color:#8a93a3;margin:8px 0 0}
 CSS;
 
 $pageOpen = function (string $title, string $crumb) use ($css): string {
@@ -290,6 +302,31 @@ $newFailures = [];
 foreach ($failing as $id => $t) {
     if (($prev['tests'][$id]['s'] ?? null) === 'pass') {
         $newFailures[$id] = true;
+    }
+}
+
+// ---- diff vs the previous run ---------------------------------------------------
+// Which tests moved onto / off the success (pass) list since $prev. Fixed =
+// was failing, now green; regressed = was green, now failing. Skip transitions
+// are counted separately so a mass ACL-scaffold skip doesn't drown the signal.
+$fixed = $regressed = [];
+$nowSkipped = $unskipped = 0;
+if ($prev) {
+    foreach ($tests as $id => $t) {
+        $pv  = $prev['tests'][$id]['s'] ?? null;
+        $cur = $t['s'];
+        if ($pv === null) {
+            continue; // brand-new test, not a transition
+        }
+        if ($cur === 'pass' && in_array($pv, ['fail', 'error'], true)) {
+            $fixed[$id] = $prev['tests'][$id];
+        } elseif ($cur !== 'pass' && $cur !== 'skip' && $pv === 'pass') {
+            $regressed[$id] = $t;
+        } elseif ($cur === 'skip' && $pv === 'pass') {
+            $nowSkipped++;
+        } elseif ($cur === 'pass' && $pv === 'skip') {
+            $unskipped++;
+        }
     }
 }
 $totTests = count($tests);
@@ -341,9 +378,51 @@ $p .= '<p>' . h(date('Y-m-d H:i T')) . ' · <a href="https://github.com/mage-os/
 $p .= '<div class=tot>'
     . '<div><b>' . number_format($totTests) . '</b>tests</div>'
     . '<div><b style="color:' . ($totFail ? '#c62828' : '#2e7d32') . '">' . $totFail . '</b>failing</div>'
-    . '<div><b>' . count($newFailures) . '</b>new vs previous run</div>'
+    . '<div><b style="color:' . (count($regressed) ? '#c62828' : 'inherit') . '">' . count($regressed) . '</b>newly failing</div>'
+    . '<div><b style="color:' . (count($fixed) ? '#2e7d32' : 'inherit') . '">' . count($fixed) . '</b>newly passing</div>'
     . '<div><b>' . $totSkip . '</b>skipped</div>'
     . '<div><b>' . gmdate('H:i:s', (int) $totTime) . '</b>test time (sum)</div></div>';
+
+// ---- changes since previous run ----
+if ($prev && ($fixed || $regressed || $nowSkipped || $unskipped)) {
+    $linkRow = function (string $id) use ($tests): string {
+        $job = $tests[$id]['job'] ?? '';
+        return $job
+            ? '<a href="jobs/' . h($job) . '.html#' . anchor($id) . '">' . h($id) . '</a>'
+            : h($id);
+    };
+    $p .= '<h2>Changes since <code>' . h(substr($prev['sha'], 0, 12)) . '</code> '
+        . '<small>(' . h(date('Y-m-d', strtotime($prev['date']))) . ')</small></h2>';
+    $p .= '<div class=diff>';
+    $p .= '<div class=diffcol><h3 class=gained>&#10003; Now passing (' . count($fixed) . ')</h3>';
+    if ($fixed) {
+        $p .= '<ul>';
+        foreach ($fixed as $id => $pt) {
+            $p .= '<li>' . $linkRow($id) . ' <span class="was s-' . h($pt['s']) . '">was ' . h($pt['s']) . '</span></li>';
+        }
+        $p .= '</ul>';
+    } else {
+        $p .= '<p class=none>none</p>';
+    }
+    $p .= '</div>';
+    $p .= '<div class=diffcol><h3 class=lost>&#10007; Newly failing (' . count($regressed) . ')</h3>';
+    if ($regressed) {
+        $p .= '<ul>';
+        foreach ($regressed as $id => $t) {
+            $p .= '<li>' . $linkRow($id) . ' <span class="was s-' . h($t['s']) . '">' . h($t['s']) . '</span></li>';
+        }
+        $p .= '</ul>';
+    } else {
+        $p .= '<p class=none>none</p>';
+    }
+    $p .= '</div></div>';
+    if ($nowSkipped || $unskipped) {
+        $bits = [];
+        if ($nowSkipped) { $bits[] = "$nowSkipped newly skipped"; }
+        if ($unskipped)  { $bits[] = "$unskipped no longer skipped"; }
+        $p .= '<p class=skipdelta>' . h(implode(' · ', $bits)) . '</p>';
+    }
+}
 
 $p .= '<h2>Jobs</h2><div class=grid>';
 foreach ($jobs as $slug => $j) {
@@ -400,18 +479,24 @@ file_put_contents("$out/$sha/index.html", $p);
 $runsFile = "$out/runs.json";
 $runs = json_decode((string) @file_get_contents($runsFile), true) ?: [];
 $runs = array_values(array_filter($runs, fn ($r) => $r['sha'] !== $sha));
-$runs[] = ['sha' => $sha, 'date' => date('c'), 'tests' => $totTests, 'failing' => $totFail, 'new' => count($newFailures)];
+$runs[] = ['sha' => $sha, 'date' => date('c'), 'tests' => $totTests, 'failing' => $totFail,
+    'new' => count($newFailures), 'fixed' => count($fixed)];
 file_put_contents($runsFile, json_encode($runs, JSON_PRETTY_PRINT) . "\n");
 
 $idx = $pageOpen('mageos-magento2 integration tests', 'mage-os/mageos-magento2 · main');
 $idx .= '<h1>mageos-magento2 · integration test runs</h1>'
-    . '<table><tr><th>date</th><th>commit</th><th class=num>tests</th><th class=num>failing</th><th class=num>new</th></tr>';
+    . '<table><tr><th>date</th><th>commit</th><th class=num>tests</th><th class=num>failing</th>'
+    . '<th class=num>newly failing</th><th class=num>newly passing</th></tr>';
 foreach (array_reverse($runs) as $r) {
     $color = $r['failing'] ? '#c62828' : '#2e7d32';
+    $nf = (int) ($r['new'] ?? 0);
+    $fx = $r['fixed'] ?? null;
     $idx .= '<tr><td>' . h(substr($r['date'], 0, 16)) . '</td><td><a href="' . h($r['sha']) . '/index.html"><code>'
         . h(substr($r['sha'], 0, 12)) . '</code></a></td><td class=num>' . number_format($r['tests'])
         . "</td><td class=num style=\"color:$color;font-weight:600\">" . $r['failing']
-        . '</td><td class=num>' . $r['new'] . '</td></tr>';
+        . '</td><td class=num' . ($nf ? ' style="color:#c62828;font-weight:600"' : '') . '>' . ($nf ?: '·')
+        . '</td><td class=num' . ($fx ? ' style="color:#2e7d32;font-weight:600"' : '') . '>'
+        . ($fx === null ? '·' : ($fx ?: '·')) . '</td></tr>';
 }
 $idx .= '</table></main>';
 file_put_contents("$out/index.html", $idx);
