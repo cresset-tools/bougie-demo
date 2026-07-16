@@ -324,7 +324,9 @@ details summary{cursor:pointer;font-size:12.5px;color:#25508f}
 .rerun{font-size:11px;color:#8a93a3;font-variant-numeric:tabular-nums}
 .hint{font-size:12.5px;color:#5c6675;margin:0 0 12px}
 tr.sub td{background:#fafbfc;color:#8a93a3;font-size:12px}
-tr.sub .dim code{color:#aeb6c2}
+tr.sub a{color:#7a90b5;text-decoration:none}
+tr.sub a:hover{text-decoration:underline}
+tr.sub .dim code{color:#7a90b5}
 .flakeh{color:#ef6c00}
 .flakeh small{color:#8a93a3;font-weight:400;font-size:12.5px}
 ul.flakelist{margin:0;padding:0;list-style:none}
@@ -437,7 +439,9 @@ foreach ($jobs as $slug => $j) {
 // ---- run overview -------------------------------------------------------------------
 $p = $pageOpen('mageos-magento2 @ ' . substr($sha, 0, 10), '<a href="../index.html">runs</a> › ' . h(substr($sha, 0, 12)));
 $p .= '<h1>mageos-magento2 <code>' . h(substr($sha, 0, 12)) . '</code></h1>';
-$p .= '<p>' . h(date('Y-m-d H:i T')) . ' · <a href="https://github.com/mage-os/mageos-magento2/commit/'
+$p .= '<p>' . h(date('Y-m-d H:i T'))
+    . ($sameCommitPrev ? ' · latest of several runs of this commit (<a href="../index.html">see all</a>)' : '')
+    . ' · <a href="https://github.com/mage-os/mageos-magento2/commit/'
     . h($sha) . '">commit on GitHub</a></p>';
 $p .= '<div class=tot>'
     . '<div><b>' . number_format($totTests) . '</b>tests</div>'
@@ -629,8 +633,9 @@ foreach (array_reverse($runRows) as $r) {
     $color   = $r['failing'] ? '#c62828' : '#2e7d32';
     $flCell  = $numCell((int) ($r['flaky'] ?? 0), '#ef6c00');
     if ($isRerun) {
-        $idx .= '<tr class=sub><td>&#8627; <span class=rerun>' . h(substr($r['date'], 0, 16)) . '</span></td>'
-            . '<td class=dim><code>' . h(substr($r['sha'], 0, 12)) . '</code></td>'
+        $idx .= '<tr class=sub><td>&#8627; <a href="' . h($r['sha']) . '/index.html" class=rerun>'
+            . h(substr($r['date'], 0, 16)) . '</a></td>'
+            . '<td class=dim><a href="' . h($r['sha']) . '/index.html"><code>' . h(substr($r['sha'], 0, 12)) . '</code></a></td>'
             . '<td class=num>' . number_format($r['tests']) . '</td>'
             . '<td class=num style="color:' . $color . '">' . $r['failing'] . '</td>'
             . '<td class=num>·</td><td class=num>·</td>' . $flCell . '</tr>';
