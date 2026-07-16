@@ -126,6 +126,12 @@ if (!$tests) {
 ksort($jobs);
 
 // ---- baseline -----------------------------------------------------------------
+// One file per run (<sha>-<YmdHis>.json), so re-runs of the same commit
+// accumulate history — that is how flaky tests surface: identical code, a
+// flipped result. Ordering keys off the timestamp embedded in the filename,
+// not mtime, which a git checkout of the baseline repo would scramble.
+$now   = date('c');
+$runId = $sha . '-' . date('YmdHis');
 $baselineTests = [];
 foreach ($tests as $id => $t) {
     $baselineTests[$id] = ['s' => $t['s'], 't' => $t['t']];
@@ -134,15 +140,23 @@ foreach ($tests as $id => $t) {
     }
 }
 file_put_contents(
-    "$baseDir/baselines/$sha.json",
-    json_encode(['schema' => 1, 'sha' => $sha, 'date' => date('c'), 'tests' => $baselineTests]) . "\n"
+    "$baseDir/baselines/$runId.json",
+    json_encode(['schema' => 2, 'sha' => $sha, 'date' => $now, 'tests' => $baselineTests]) . "\n"
 );
 
-$history = [];
+$runTime = fn (string $f): string => preg_match('/-(\d{14})\.json$/', $f, $m) ? $m[1] : '0';
 $files = glob("$baseDir/baselines/*.json");
-usort($files, fn ($a, $b) => filemtime($a) <=> filemtime($b));
+usort($files, fn ($a, $b) => strcmp($runTime($a), $runTime($b)));
+// Bound the working tree (git history keeps the long-term record; the
+// sparklines only read the most recent runs anyway).
+foreach (array_slice($files, 0, -60) as $old) {
+    @unlink($old);
+}
+$files = array_slice($files, -60);
+
+$history = [];
 foreach (array_slice($files, -31) as $f) {
-    if (basename($f, '.json') === $sha) {
+    if (basename($f, '.json') === $runId) {
         continue;
     }
     $b = json_decode((string) file_get_contents($f), true);
@@ -151,6 +165,15 @@ foreach (array_slice($files, -31) as $f) {
     }
 }
 $prev = $history ? end($history) : null;
+// Most recent prior run of *this same commit*: flips against it are flakes
+// (same code, different outcome), surfaced on the run-history landing page.
+$sameCommitPrev = null;
+for ($i = count($history) - 1; $i >= 0; $i--) {
+    if (($history[$i]['sha'] ?? null) === $sha) {
+        $sameCommitPrev = $history[$i];
+        break;
+    }
+}
 
 // ---- helpers --------------------------------------------------------------------
 function h(string $s): string
@@ -283,6 +306,8 @@ details summary{cursor:pointer;font-size:12.5px;color:#25508f}
 .was{font:10.5px system-ui,sans-serif;color:#fff;background:#9aa4b1;border-radius:8px;padding:0 6px;margin-left:4px;white-space:nowrap}
 .was.s-fail,.was.s-error{background:#e53935}.was.s-skip{background:#b0bec5}
 .skipdelta{font-size:12px;color:#8a93a3;margin:8px 0 0}
+.rerun{font-size:10.5px;color:#8a93a3;font-variant-numeric:tabular-nums}
+.hint{font-size:12.5px;color:#5c6675;margin:0 0 12px}
 CSS;
 
 $pageOpen = function (string $title, string $crumb) use ($css): string {
@@ -326,6 +351,24 @@ if ($prev) {
             $nowSkipped++;
         } elseif ($cur === 'pass' && $pv === 'skip') {
             $unskipped++;
+        }
+    }
+}
+$prevIsSameCommit = $prev && ($prev['sha'] ?? null) === $sha;
+
+// Flakes: tests that flipped pass<->fail between two runs of the *same*
+// commit (identical code, different outcome). Only meaningful once a commit
+// has been re-run; 0 on a commit's first run.
+$flakes = [];
+if ($sameCommitPrev) {
+    foreach ($tests as $id => $t) {
+        $pv  = $sameCommitPrev['tests'][$id]['s'] ?? null;
+        $cur = $t['s'];
+        if ($pv === null || $pv === 'skip' || $cur === 'skip') {
+            continue;
+        }
+        if (($pv === 'pass') !== ($cur === 'pass')) {
+            $flakes[$id] = ['from' => $pv, 'to' => $cur];
         }
     }
 }
@@ -392,7 +435,9 @@ if ($prev && ($fixed || $regressed || $nowSkipped || $unskipped)) {
             : h($id);
     };
     $p .= '<h2>Changes since <code>' . h(substr($prev['sha'], 0, 12)) . '</code> '
-        . '<small>(' . h(date('Y-m-d', strtotime($prev['date']))) . ')</small></h2>';
+        . '<small>(' . h(date('Y-m-d H:i', strtotime($prev['date'])))
+        . ($prevIsSameCommit ? ' · same commit re-run — these flips are flaky tests' : '')
+        . ')</small></h2>';
     $p .= '<div class=diff>';
     $p .= '<div class=diffcol><h3 class=gained>&#10003; Now passing (' . count($fixed) . ')</h3>';
     if ($fixed) {
@@ -476,32 +521,57 @@ $p .= '</table></main>';
 file_put_contents("$out/$sha/index.html", $p);
 
 // ---- runs index -----------------------------------------------------------------------
+// One row per commit — re-runs of the same commit UPDATE its row rather than
+// piling up, so the page never clutters. The re-run count and flaky flips are
+// folded into that single row instead.
 $runsFile = "$out/runs.json";
 $runs = json_decode((string) @file_get_contents($runsFile), true) ?: [];
-$runs = array_values(array_filter($runs, fn ($r) => $r['sha'] !== $sha));
-$runs[] = ['sha' => $sha, 'date' => date('c'), 'tests' => $totTests, 'failing' => $totFail,
-    'new' => count($newFailures), 'fixed' => count($fixed)];
+$prevRow = null;
+foreach ($runs as $r) {
+    if (($r['sha'] ?? null) === $sha) {
+        $prevRow = $r;
+    }
+}
+$runs = array_values(array_filter($runs, fn ($r) => ($r['sha'] ?? null) !== $sha));
+$runs[] = [
+    'sha'     => $sha,
+    'date'    => $now,
+    'tests'   => $totTests,
+    'failing' => $totFail,
+    'new'     => count($newFailures),
+    'fixed'   => count($fixed),
+    'runs'    => (int) ($prevRow['runs'] ?? 0) + 1,
+    'flaky'   => count($flakes),
+];
 file_put_contents($runsFile, json_encode($runs, JSON_PRETTY_PRINT) . "\n");
 
 $idx = $pageOpen('mageos-magento2 integration tests', 'mage-os/mageos-magento2 · main');
 $idx .= '<h1>mageos-magento2 · integration test runs</h1>'
-    . '<table><tr><th>date</th><th>commit</th><th class=num>tests</th><th class=num>failing</th>'
-    . '<th class=num>newly failing</th><th class=num>newly passing</th></tr>';
+    . '<p class=hint>One row per commit. <b>flaky</b> = tests that flipped pass&harr;fail between '
+    . 're-runs of the <em>same</em> commit — definitive flakes.</p>'
+    . '<div style="overflow-x:auto"><table><tr><th>date</th><th>commit</th><th class=num>tests</th>'
+    . '<th class=num>failing</th><th class=num>newly failing</th><th class=num>newly passing</th>'
+    . '<th class=num>flaky</th></tr>';
 foreach (array_reverse($runs) as $r) {
-    $color = $r['failing'] ? '#c62828' : '#2e7d32';
-    $nf = (int) ($r['new'] ?? 0);
-    $fx = $r['fixed'] ?? null;
-    $idx .= '<tr><td>' . h(substr($r['date'], 0, 16)) . '</td><td><a href="' . h($r['sha']) . '/index.html"><code>'
+    $color   = $r['failing'] ? '#c62828' : '#2e7d32';
+    $nf      = (int) ($r['new'] ?? 0);
+    $fx      = $r['fixed'] ?? null;
+    $fl      = $r['flaky'] ?? null;
+    $runsN   = (int) ($r['runs'] ?? 1);
+    $numCell = fn ($v, string $col) => '<td class=num' . ($v ? " style=\"color:$col;font-weight:600\"" : '')
+        . '>' . ($v === null ? '·' : ($v ?: '·')) . '</td>';
+    $idx .= '<tr><td>' . h(substr($r['date'], 0, 16))
+        . ($runsN > 1 ? ' <span class=rerun>&times;' . $runsN . '</span>' : '')
+        . '</td><td><a href="' . h($r['sha']) . '/index.html"><code>'
         . h(substr($r['sha'], 0, 12)) . '</code></a></td><td class=num>' . number_format($r['tests'])
-        . "</td><td class=num style=\"color:$color;font-weight:600\">" . $r['failing']
-        . '</td><td class=num' . ($nf ? ' style="color:#c62828;font-weight:600"' : '') . '>' . ($nf ?: '·')
-        . '</td><td class=num' . ($fx ? ' style="color:#2e7d32;font-weight:600"' : '') . '>'
-        . ($fx === null ? '·' : ($fx ?: '·')) . '</td></tr>';
+        . "</td><td class=num style=\"color:$color;font-weight:600\">" . $r['failing'] . '</td>'
+        . $numCell($nf, '#c62828') . $numCell($fx, '#2e7d32') . $numCell($fl, '#ef6c00') . '</tr>';
 }
-$idx .= '</table></main>';
+$idx .= '</table></div></main>';
 file_put_contents("$out/index.html", $idx);
 
 printf(
-    "report: %s/%s/index.html  (%d tests, %d failing, %d new, %d job pages)\n",
-    $out, $sha, $totTests, $totFail, count($newFailures), count($jobs)
+    "report: %s/%s/index.html  (%d tests, %d failing, %d new, %d flaky, run #%d of this commit, %d job pages)\n",
+    $out, $sha, $totTests, $totFail, count($newFailures), count($flakes),
+    (int) ($prevRow['runs'] ?? 0) + 1, count($jobs)
 );
